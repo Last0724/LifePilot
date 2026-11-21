@@ -4,12 +4,12 @@ LifePilot is a local productivity planner and competition demo. It puts a real w
 
 ## Run locally
 
-From the repository root:
+From the repository root, using Python 3.12:
 
 ```sh
-python3 -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
-python -m pip install streamlit==1.55.0
+python -m pip install -r requirements.txt
 python -m streamlit run app.py --server.address 127.0.0.1 --server.port 8511
 ```
 
