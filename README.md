@@ -31,7 +31,7 @@ Install dependencies:
 Run the application:
 
     streamlit run app.py
-
+先休息休息
 ## API Configuration
 
 Store API credentials in Streamlit secrets.
