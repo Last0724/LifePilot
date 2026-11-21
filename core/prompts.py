@@ -2,9 +2,11 @@
 
 Two calls are made per user:
 
-1. ANALYSIS - read the questionnaire and propose at most two follow-ups.
-2. PROFILE  - turn the questionnaire plus the follow-up answers into a
-   structured profile.
+1. ANALYSIS - read the questionnaire and propose at most two follow-ups,
+   each carrying a stable id (``q1``, ``q2``) so the UI can round-trip the
+   answers under the same keys.
+2. PROFILE  - turn the questionnaire plus those answers into a structured
+   profile.
 
 Both prompts demand a single JSON object. The reply is always validated by
 ``core.ai_consultant`` before it reaches the scheduler, so the model is
@@ -36,13 +38,15 @@ absent. Never ask about something the user already answered.
 
 Reply with exactly this JSON shape:
 {{
-  "summary": "one or two sentences describing this user",
-  "follow_up_questions": ["question", "..."],
-  "is_sufficient": true
+  "follow_up_questions": [
+    {{"id": "q1", "question": "..."}},
+    {{"id": "q2", "question": "..."}}
+  ]
 }}
 
 Rules:
-- follow_up_questions must contain at most {max_questions} items.
+- At most {max_questions} questions, in the order they should be asked.
+- Use the ids "q1" and "q2", in that order.
 - Return an empty list when the questionnaire is already sufficient.
 - Each question must be answerable in one short sentence.
 - Return raw JSON. No markdown fences, no commentary.
@@ -53,7 +57,8 @@ PROFILE_PROMPT = """Build the final user profile.
 Questionnaire (JSON):
 {questionnaire}
 
-Follow-up answers (JSON, an empty object when no question was asked):
+Follow-up answers (JSON; keys match the question ids, empty when no question
+was asked):
 {follow_up_answers}
 
 Reply with exactly this JSON shape:

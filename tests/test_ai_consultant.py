@@ -39,46 +39,73 @@ QUESTIONNAIRE = {
 
 
 class StartConsultationTests(unittest.TestCase):
-    def test_returns_model_output(self):
+    def test_returns_question_objects_with_ids(self):
         client = FakeClient(
             {
-                "summary": "A student writing a thesis.",
-                "follow_up_questions": ["Which deadline is closest?"],
+                "follow_up_questions": [
+                    {"id": "q1", "question": "Which deadline is closest?"},
+                    {"id": "q2", "question": "How long can you focus?"},
+                ]
             }
         )
         draft = ai_consultant.start_consultation(QUESTIONNAIRE, client=client)
 
-        self.assertEqual(draft["summary"], "A student writing a thesis.")
-        self.assertEqual(draft["follow_up_questions"], ["Which deadline is closest?"])
-        self.assertFalse(draft["is_fallback"])
-
-    def test_never_returns_more_than_two_questions(self):
-        client = FakeClient(
-            {"summary": "x", "follow_up_questions": ["a", "b", "c", "d"]}
+        self.assertEqual(
+            draft["follow_up_questions"],
+            [
+                {"id": "q1", "question": "Which deadline is closest?"},
+                {"id": "q2", "question": "How long can you focus?"},
+            ],
         )
+
+    def test_draft_contains_only_questions(self):
+        client = FakeClient({"follow_up_questions": []})
+        draft = ai_consultant.start_consultation(QUESTIONNAIRE, client=client)
+
+        self.assertEqual(set(draft.keys()), {"follow_up_questions"})
+
+    def test_bare_strings_are_accepted_and_ided(self):
+        client = FakeClient({"follow_up_questions": ["First?", "Second?"]})
+        draft = ai_consultant.start_consultation(QUESTIONNAIRE, client=client)
+
+        ids = [item["id"] for item in draft["follow_up_questions"]]
+        self.assertEqual(ids, ["q1", "q2"])
+
+    def test_model_supplied_ids_are_replaced(self):
+        client = FakeClient(
+            {"follow_up_questions": [{"id": "zzz", "question": "A?"}]}
+        )
+        draft = ai_consultant.start_consultation(QUESTIONNAIRE, client=client)
+
+        self.assertEqual(draft["follow_up_questions"][0]["id"], "q1")
+
+    def test_never_returns_more_than_two(self):
+        client = FakeClient({"follow_up_questions": ["a", "b", "c", "d"]})
         draft = ai_consultant.start_consultation(QUESTIONNAIRE, client=client)
 
         self.assertEqual(len(draft["follow_up_questions"]), 2)
 
-    def test_empty_question_list_is_allowed(self):
-        client = FakeClient({"summary": "x", "follow_up_questions": []})
+    def test_blank_questions_are_dropped(self):
+        client = FakeClient(
+            {"follow_up_questions": [{"id": "q1", "question": "   "}, "Real?"]}
+        )
+        draft = ai_consultant.start_consultation(QUESTIONNAIRE, client=client)
+
+        self.assertEqual(
+            draft["follow_up_questions"], [{"id": "q1", "question": "Real?"}]
+        )
+
+    def test_non_list_questions_are_ignored(self):
+        client = FakeClient({"follow_up_questions": 123})
         draft = ai_consultant.start_consultation(QUESTIONNAIRE, client=client)
 
         self.assertEqual(draft["follow_up_questions"], [])
-        self.assertFalse(draft["is_fallback"])
 
-    def test_non_list_questions_are_dropped(self):
-        client = FakeClient({"summary": "x", "follow_up_questions": 123})
-        draft = ai_consultant.start_consultation(QUESTIONNAIRE, client=client)
-
-        self.assertEqual(draft["follow_up_questions"], [])
-
-    def test_api_failure_degrades_to_fallback(self):
+    def test_api_failure_returns_empty_list(self):
         client = FakeClient(error=AINetworkError("service down"))
         draft = ai_consultant.start_consultation(QUESTIONNAIRE, client=client)
 
-        self.assertTrue(draft["is_fallback"])
-        self.assertEqual(draft["follow_up_questions"], [])
+        self.assertEqual(draft, {"follow_up_questions": []})
 
 
 class FinalizeProfileTests(unittest.TestCase):
@@ -151,6 +178,18 @@ class FinalizeProfileTests(unittest.TestCase):
 
         self.assertFalse(profile["is_fallback"])
 
+    def test_answers_are_keyed_by_question_id(self):
+        self.assertEqual(
+            ai_consultant._clean_answers({"q1": "Morning", "q2": "50 minutes"}),
+            {"q1": "Morning", "q2": "50 minutes"},
+        )
+
+    def test_unknown_answer_keys_are_dropped(self):
+        self.assertEqual(
+            ai_consultant._clean_answers({"q1": "Morning", "q9": "junk", "q2": ""}),
+            {"q1": "Morning"},
+        )
+
 
 class FallbackProfileTests(unittest.TestCase):
     def test_uses_only_explicit_information(self):
@@ -203,6 +242,9 @@ class HelperTests(unittest.TestCase):
 
     def test_clean_list_drops_blank_entries(self):
         self.assertEqual(ai_consultant._clean_list(["a", "", "  ", None]), ["a"])
+
+    def test_follow_up_ids_match_documented_keys(self):
+        self.assertEqual(ai_consultant.FOLLOW_UP_IDS, ("q1", "q2"))
 
 
 if __name__ == "__main__":

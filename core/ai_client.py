@@ -1,25 +1,18 @@
 """DeepSeek chat completion client.
 
-This module owns every detail of talking to the DeepSeek API: resolving
-credentials, performing the HTTP request, translating transport failures
-into a small set of project exceptions, and turning a model reply into a
-Python dictionary.
+Built on the official OpenAI SDK (``openai>=1.0.0``) pointed at the DeepSeek
+endpoint, which exposes an OpenAI-compatible API. This module owns
+credential resolution, error translation and JSON extraction, so
+``core.ai_consultant`` can stay concerned with prompts and validation only.
 
-Only the standard library is used. That keeps the module importable and
-testable on a machine where no third-party package has been installed yet,
-which matters because ``requirements.txt`` is owned by the Technical Lead.
-
-Business rules (what to ask, how to validate a profile) live in
-``core.ai_consultant``. This file stays transport-focused.
+The SDK client is created lazily: importing this module must not require an
+API key, because the test suite runs without one.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import socket
-import urllib.error
-import urllib.request
 from typing import Any
 
 __all__ = [
@@ -32,6 +25,7 @@ __all__ = [
     "read_api_key",
     "DEFAULT_BASE_URL",
     "DEFAULT_MODEL",
+    "ENV_KEY_NAME",
 ]
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
@@ -50,11 +44,11 @@ class AIError(Exception):
 
 
 class AIConfigError(AIError):
-    """The API key is missing, or the provider rejected it."""
+    """The API key is missing or rejected, or the SDK is not installed."""
 
 
 class AINetworkError(AIError):
-    """The provider could not be reached, or the request timed out."""
+    """The provider could not be reached, timed out, or rate-limited us."""
 
 
 class AIResponseError(AIError):
@@ -70,12 +64,11 @@ def read_api_key(explicit_key: str | None = None) -> str:
     """Resolve the DeepSeek API key.
 
     Priority order:
-        1. the ``explicit_key`` argument (used by tests and by callers that
-           already hold a key),
+        1. the ``explicit_key`` argument (tests, or callers holding a key),
         2. the ``DEEPSEEK_API_KEY`` environment variable,
         3. Streamlit secrets (``.streamlit/secrets.toml``).
 
-    Raises ``AIConfigError`` when none of them is set, so the caller gets an
+    Raises ``AIConfigError`` when none is set, so the caller gets an
     actionable message instead of an authentication failure from the server.
     """
     if explicit_key and explicit_key.strip():
@@ -98,8 +91,8 @@ def read_api_key(explicit_key: str | None = None) -> str:
 def _read_streamlit_secret() -> str:
     """Return the key from Streamlit secrets, or an empty string.
 
-    Streamlit is an optional import here: the module must work in a plain
-    Python test run where Streamlit is not installed.
+    Streamlit is an optional import: the module must work in a plain Python
+    test run where Streamlit is not installed.
     """
     try:
         import streamlit as st  # noqa: PLC0415 - optional dependency
@@ -169,10 +162,11 @@ def _strip_code_fence(text: str) -> str:
 
 
 class DeepSeekClient:
-    """Minimal chat-completion client for the DeepSeek API.
+    """Chat-completion client for the DeepSeek API.
 
-    The client is stateless between calls apart from its configuration, so a
-    single instance can be reused across a Streamlit session.
+    The underlying SDK client is created on first use so that importing this
+    module never requires credentials. An ``sdk`` instance may be injected for
+    tests, which keeps the suite offline.
     """
 
     def __init__(
@@ -181,11 +175,13 @@ class DeepSeekClient:
         base_url: str | None = None,
         model: str | None = None,
         timeout: int | None = None,
+        sdk: Any | None = None,
     ) -> None:
         self._api_key = api_key
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self.model = model or DEFAULT_MODEL
         self.timeout = timeout or DEFAULT_TIMEOUT_SECONDS
+        self._sdk = sdk
 
     # -- public API ---------------------------------------------------------
 
@@ -203,29 +199,22 @@ class DeepSeekClient:
         if not messages:
             raise AIResponseError("messages must not be empty.")
 
-        api_key = read_api_key(self._api_key)
+        client = self._get_client()
 
-        payload: dict[str, Any] = {
+        kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
-            "stream": False,
         }
         if json_mode:
-            payload["response_format"] = {"type": "json_object"}
+            kwargs["response_format"] = {"type": "json_object"}
 
-        request = urllib.request.Request(
-            url=f"{self.base_url}/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            },
-            method="POST",
-        )
+        try:
+            response = client.chat.completions.create(**kwargs)
+        except Exception as exc:  # translated below
+            raise self._translate_error(exc) from exc
 
-        raw_body = self._post(request)
-        return self._extract_content(raw_body)
+        return self._extract_content(response)
 
     def chat_json(
         self,
@@ -237,68 +226,69 @@ class DeepSeekClient:
 
     # -- internals ----------------------------------------------------------
 
-    def _post(self, request: urllib.request.Request) -> str:
-        """Execute the request and return the decoded body."""
+    def _get_client(self) -> Any:
+        """Return the SDK client, creating it on first use."""
+        if self._sdk is not None:
+            return self._sdk
+
+        api_key = read_api_key(self._api_key)
+
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                return response.read().decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as exc:
-            raise self._translate_http_error(exc) from exc
-        except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
-            raise AINetworkError(f"Could not reach the DeepSeek API: {exc}") from exc
+            from openai import OpenAI  # noqa: PLC0415 - optional until used
+        except ImportError as exc:
+            raise AIConfigError(
+                "The openai package is not installed. The Technical Lead "
+                "needs to add 'openai>=1.0.0' to requirements.txt."
+            ) from exc
 
-    @staticmethod
-    def _translate_http_error(exc: urllib.error.HTTPError) -> AIError:
-        """Map an HTTP status onto the project's exception hierarchy."""
-        detail = ""
-        try:
-            detail = exc.read().decode("utf-8", errors="replace")[:200]
-        except Exception:
-            detail = ""
-
-        if exc.code in (401, 403):
-            return AIConfigError(
-                f"DeepSeek rejected the API key (HTTP {exc.code}). "
-                "Check that the key is valid and not expired."
-            )
-        if exc.code == 429:
-            return AINetworkError(
-                "DeepSeek rate limit reached (HTTP 429). Retry after a pause."
-            )
-        if 500 <= exc.code < 600:
-            return AINetworkError(f"DeepSeek service error (HTTP {exc.code}).")
-
-        return AIResponseError(
-            f"Unexpected DeepSeek response (HTTP {exc.code}): {detail}"
+        self._sdk = OpenAI(
+            api_key=api_key,
+            base_url=self.base_url,
+            timeout=self.timeout,
         )
+        return self._sdk
 
     @staticmethod
-    def _extract_content(raw_body: str) -> str:
-        """Validate the envelope and return ``choices[0].message.content``."""
-        if not raw_body or not raw_body.strip():
-            raise AIResponseError("DeepSeek returned an empty body.")
-
+    def _translate_error(exc: Exception) -> AIError:
+        """Map an SDK or transport failure onto the project's exceptions."""
         try:
-            data = json.loads(raw_body)
-        except json.JSONDecodeError as exc:
-            raise AIResponseError("DeepSeek returned a non-JSON body.") from exc
+            import openai  # noqa: PLC0415 - only needed when an error occurs
+        except ImportError:
+            return AIResponseError(f"AI client error: {exc}")
 
-        if not isinstance(data, dict):
-            raise AIResponseError("DeepSeek returned an unexpected payload shape.")
+        if isinstance(exc, (openai.AuthenticationError, openai.PermissionDeniedError)):
+            return AIConfigError(
+                "DeepSeek rejected the API key. Check that it is valid and "
+                "has not expired."
+            )
 
-        choices = data.get("choices")
-        if not isinstance(choices, list) or not choices:
+        if isinstance(exc, (openai.APITimeoutError, openai.APIConnectionError)):
+            return AINetworkError(f"Could not reach the DeepSeek API: {exc}")
+
+        if isinstance(exc, (openai.RateLimitError, openai.InternalServerError)):
+            return AINetworkError(f"DeepSeek is unavailable right now: {exc}")
+
+        if isinstance(exc, openai.APIError):
+            return AIResponseError(f"DeepSeek returned an error: {exc}")
+
+        return AIResponseError(f"Unexpected AI client error: {exc}")
+
+    @staticmethod
+    def _extract_content(response: Any) -> str:
+        """Read ``choices[0].message.content`` from an SDK response.
+
+        ``getattr`` is used throughout so that a mock response behaves like a
+        real one during tests.
+        """
+        choices = getattr(response, "choices", None)
+        if not choices:
             raise AIResponseError("DeepSeek returned no choices.")
 
-        first = choices[0]
-        if not isinstance(first, dict):
-            raise AIResponseError("DeepSeek returned a malformed choice.")
-
-        message = first.get("message")
-        if not isinstance(message, dict):
+        message = getattr(choices[0], "message", None)
+        if message is None:
             raise AIResponseError("DeepSeek returned a choice without a message.")
 
-        content = message.get("content")
+        content = getattr(message, "content", None)
         if not isinstance(content, str) or not content.strip():
             raise AIResponseError("DeepSeek returned an empty message.")
 

@@ -1,50 +1,57 @@
 """Tests for ``core.ai_client``.
 
-Every test runs offline. The HTTP layer is mocked, so no API key and no
-network access are required - which is exactly why the module uses the
-standard library instead of a third-party SDK.
+Every test runs offline. A fake SDK object is injected instead of a real
+``openai.OpenAI`` client, so no API key and no network access are required.
 """
 
 from __future__ import annotations
 
-import io
 import json
 import os
-import socket
+import sys
 import unittest
-import urllib.error
+from types import SimpleNamespace
 from unittest import mock
 
 from core import ai_client
 
-
-def _fake_response(content: str) -> mock.MagicMock:
-    """Build a urlopen-compatible context manager returning a chat envelope."""
-    payload = {"choices": [{"message": {"content": content}}]}
-    handle = mock.MagicMock()
-    handle.read.return_value = json.dumps(payload).encode("utf-8")
-    handle.__enter__.return_value = handle
-    handle.__exit__.return_value = False
-    return handle
+try:
+    import openai
+except ImportError:  # pragma: no cover - exercised only without the SDK
+    openai = None
 
 
-def _raw_response(body: bytes) -> mock.MagicMock:
-    """Build a context manager that returns an arbitrary raw body."""
-    handle = mock.MagicMock()
-    handle.read.return_value = body
-    handle.__enter__.return_value = handle
-    handle.__exit__.return_value = False
-    return handle
-
-
-def _http_error(code: int) -> urllib.error.HTTPError:
-    return urllib.error.HTTPError(
-        url="https://api.deepseek.com/chat/completions",
-        code=code,
-        msg="error",
-        hdrs=None,
-        fp=io.BytesIO(b'{"error": "boom"}'),
+def _response(content: str) -> SimpleNamespace:
+    """Build an object shaped like a chat completion response."""
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
     )
+
+
+def _sdk(content: str | None = None, error: Exception | None = None) -> SimpleNamespace:
+    """Build a fake SDK whose create() returns content or raises error."""
+
+    def create(**kwargs):
+        if error is not None:
+            raise error
+        return _response(content or "")
+
+    create_fn = mock.MagicMock(side_effect=create)
+    return SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create_fn))
+    )
+
+
+def _make_error(error_class, message: str = "boom") -> BaseException:
+    """Create a real SDK exception without its network-related arguments.
+
+    openai 3.x builds these from HTTP responses, which would drag an extra
+    HTTP dependency into the test suite. Bypassing ``__init__`` still produces
+    an instance that ``isinstance`` recognises and that can be raised.
+    """
+    error = error_class.__new__(error_class)
+    Exception.__init__(error, message)
+    return error
 
 
 class ExtractJsonObjectTests(unittest.TestCase):
@@ -100,68 +107,112 @@ class ReadApiKeyTests(unittest.TestCase):
 
 
 class ChatTests(unittest.TestCase):
-    def _client(self) -> ai_client.DeepSeekClient:
-        return ai_client.DeepSeekClient(api_key="test-key")
-
     def test_successful_call_returns_text(self):
-        with mock.patch(
-            "urllib.request.urlopen", return_value=_fake_response('{"ok": true}')
-        ):
-            text = self._client().chat([{"role": "user", "content": "hi"}])
+        client = ai_client.DeepSeekClient(api_key="test-key", sdk=_sdk('{"ok": true}'))
+        text = client.chat([{"role": "user", "content": "hi"}])
         self.assertEqual(text, '{"ok": true}')
 
     def test_chat_json_returns_dict(self):
-        with mock.patch(
-            "urllib.request.urlopen",
-            return_value=_fake_response("```json\n{\"ok\": true}\n```"),
-        ):
-            result = self._client().chat_json([{"role": "user", "content": "hi"}])
-        self.assertEqual(result, {"ok": True})
+        client = ai_client.DeepSeekClient(
+            api_key="test-key",
+            sdk=_sdk("```json\n{\"ok\": true}\n```"),
+        )
+        self.assertEqual(
+            client.chat_json([{"role": "user", "content": "hi"}]),
+            {"ok": True},
+        )
+
+    def test_json_mode_sends_response_format(self):
+        fake = _sdk('{"ok": true}')
+        client = ai_client.DeepSeekClient(api_key="test-key", sdk=fake)
+
+        client.chat([{"role": "user", "content": "hi"}])
+
+        sent = fake.chat.completions.create.call_args.kwargs
+        self.assertEqual(sent["response_format"], {"type": "json_object"})
+
+    def test_json_mode_can_be_disabled(self):
+        fake = _sdk("plain text")
+        client = ai_client.DeepSeekClient(api_key="test-key", sdk=fake)
+
+        client.chat([{"role": "user", "content": "hi"}], json_mode=False)
+
+        sent = fake.chat.completions.create.call_args.kwargs
+        self.assertNotIn("response_format", sent)
 
     def test_empty_messages_are_rejected(self):
+        client = ai_client.DeepSeekClient(api_key="test-key", sdk=_sdk("{}"))
         with self.assertRaises(ai_client.AIResponseError):
-            self._client().chat([])
+            client.chat([])
 
-    def test_unauthorized_raises_config_error(self):
-        with mock.patch("urllib.request.urlopen", side_effect=_http_error(401)):
+    def test_missing_sdk_raises_config_error(self):
+        client = ai_client.DeepSeekClient(api_key="test-key")
+        with mock.patch.dict(sys.modules, {"openai": None}):
             with self.assertRaises(ai_client.AIConfigError):
-                self._client().chat([{"role": "user", "content": "hi"}])
+                client.chat([{"role": "user", "content": "hi"}])
 
-    def test_rate_limit_raises_network_error(self):
-        with mock.patch("urllib.request.urlopen", side_effect=_http_error(429)):
-            with self.assertRaises(ai_client.AINetworkError):
-                self._client().chat([{"role": "user", "content": "hi"}])
+    def test_response_without_choices_is_rejected(self):
+        fake = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=mock.MagicMock(return_value=SimpleNamespace(choices=[]))
+                )
+            )
+        )
+        client = ai_client.DeepSeekClient(api_key="test-key", sdk=fake)
+        with self.assertRaises(ai_client.AIResponseError):
+            client.chat([{"role": "user", "content": "hi"}])
 
-    def test_server_error_raises_network_error(self):
-        with mock.patch("urllib.request.urlopen", side_effect=_http_error(500)):
-            with self.assertRaises(ai_client.AINetworkError):
-                self._client().chat([{"role": "user", "content": "hi"}])
+    def test_empty_content_is_rejected(self):
+        client = ai_client.DeepSeekClient(api_key="test-key", sdk=_sdk("   "))
+        with self.assertRaises(ai_client.AIResponseError):
+            client.chat([{"role": "user", "content": "hi"}])
 
-    def test_timeout_raises_network_error(self):
-        with mock.patch(
-            "urllib.request.urlopen", side_effect=socket.timeout("timed out")
-        ):
-            with self.assertRaises(ai_client.AINetworkError):
-                self._client().chat([{"role": "user", "content": "hi"}])
 
-    def test_empty_body_is_rejected(self):
-        with mock.patch("urllib.request.urlopen", return_value=_raw_response(b"")):
-            with self.assertRaises(ai_client.AIResponseError):
-                self._client().chat([{"role": "user", "content": "hi"}])
+@unittest.skipIf(openai is None, "openai SDK is not installed")
+class ErrorTranslationTests(unittest.TestCase):
+    """Verify that SDK exceptions map onto the project's own hierarchy."""
 
-    def test_missing_choices_are_rejected(self):
-        with mock.patch(
-            "urllib.request.urlopen", return_value=_raw_response(b'{"choices": []}')
-        ):
-            with self.assertRaises(ai_client.AIResponseError):
-                self._client().chat([{"role": "user", "content": "hi"}])
+    def _assert_maps_to(self, error: BaseException, expected: type) -> None:
+        client = ai_client.DeepSeekClient(api_key="test-key", sdk=_sdk(error=error))
+        with self.assertRaises(expected):
+            client.chat([{"role": "user", "content": "hi"}])
 
-    def test_non_json_body_is_rejected(self):
-        with mock.patch(
-            "urllib.request.urlopen", return_value=_raw_response(b"<html>502</html>")
-        ):
-            with self.assertRaises(ai_client.AIResponseError):
-                self._client().chat([{"role": "user", "content": "hi"}])
+    def test_authentication_error_maps_to_config_error(self):
+        self._assert_maps_to(
+            _make_error(openai.AuthenticationError), ai_client.AIConfigError
+        )
+
+    def test_permission_denied_maps_to_config_error(self):
+        self._assert_maps_to(
+            _make_error(openai.PermissionDeniedError), ai_client.AIConfigError
+        )
+
+    def test_timeout_maps_to_network_error(self):
+        self._assert_maps_to(
+            _make_error(openai.APITimeoutError), ai_client.AINetworkError
+        )
+
+    def test_connection_error_maps_to_network_error(self):
+        self._assert_maps_to(
+            _make_error(openai.APIConnectionError), ai_client.AINetworkError
+        )
+
+    def test_rate_limit_maps_to_network_error(self):
+        self._assert_maps_to(
+            _make_error(openai.RateLimitError), ai_client.AINetworkError
+        )
+
+    def test_server_error_maps_to_network_error(self):
+        self._assert_maps_to(
+            _make_error(openai.InternalServerError), ai_client.AINetworkError
+        )
+
+    def test_generic_api_error_maps_to_response_error(self):
+        self._assert_maps_to(_make_error(openai.APIError), ai_client.AIResponseError)
+
+    def test_unexpected_exception_maps_to_response_error(self):
+        self._assert_maps_to(RuntimeError("boom"), ai_client.AIResponseError)
 
 
 if __name__ == "__main__":
