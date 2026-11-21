@@ -1,23 +1,23 @@
-"""Prompt templates for the LifePilot AI consultation (Core Models V1.1).
+"""Prompt templates for the LifePilot AI consultation (Core Models V1.2).
 
-Two calls are made per user:
+Three LLM responsibilities, three prompts. Python owns every decision; the
+model is treated as an unreliable narrator that only does three things:
 
-1. ANALYSIS - read the questionnaire, propose at most two follow-ups in
-   priority order, and classify the activities the user already mentioned.
-2. PROFILE  - turn the *confirmed* questionnaire plus the follow-up answers
-   into a structured profile.
+1. PHRASE   - turn the fields Python selected into natural questions.
+2. CLASSIFY - classify the activities the user already mentioned.
+3. PROFILE  - turn *confirmed* information into a structured profile.
 
-Both prompts demand a single JSON object. The reply is always validated by
-``core.ai_consultant`` before it reaches the scheduler, so the model is
-treated as an unreliable narrator rather than an authority.
+Neither the phrase nor the classify step decides priority, which fields to
+ask, or how many questions appear. Those are owned by
+``core.ai_consultant.ConsultationController``.
 
 Category vocabulary
 -------------------
-``ActivityCategory`` belongs to ``core.models`` (owned by the Technical
-Lead). This module never redefines it: it imports the enum when it exists and
-otherwise falls back to the same four literal values agreed in the V1.1
-contract. Prompt text and validator therefore share one vocabulary, and
-``core.ai_consultant`` imports it from here rather than keeping a second copy.
+``ActivityCategory`` belongs to ``core.models`` (owned by DSH). This module
+never redefines it: it imports the enum when it exists and otherwise falls
+back to the same four literal values. Prompt text and validator therefore
+share one vocabulary, and ``core.ai_consultant`` imports it from here rather
+than keeping a second copy.
 """
 
 from __future__ import annotations
@@ -25,10 +25,11 @@ from __future__ import annotations
 MAX_FOLLOW_UP_QUESTIONS = 2
 MAX_ACTIVITY_SUGGESTIONS = 12
 MIN_WORK_BLOCK_MINUTES = 15
-MAX_WORK_BLOCK_MINUTES = 120
+MAX_WORK_BLOCK_MINUTES = 180
+DEFAULT_WORK_BLOCK_MINUTES = 50
 
-# Literal values from the V1.1 contract, used only while core.models has not
-# landed. Once it does, the enum is the source of truth.
+# Literal values used only while core.models has not landed. Once it does,
+# the enum is the source of truth.
 _FALLBACK_CATEGORIES = (
     "hard_commitment",
     "rest_period",
@@ -48,9 +49,30 @@ else:
         str(getattr(member, "value", member)) for member in _ActivityCategory
     )
 
-# P0 is the most important tier. Questions are sorted by this order before the
-# two-question cap is applied.
-QUESTION_PRIORITIES = ("P0", "P1", "P2", "P3")
+# P0 is the most important tier. The controller maps missing fields onto these
+# five tiers and selects questions in this order; the prompt only echoes it so
+# the model phrases in the order it is handed.
+QUESTION_PRIORITIES = ("P0", "P1", "P2", "P3", "P4")
+
+# Human-facing meaning of each questionnaire field the consultation may ask
+# about. Used only to give the phrasing model enough context to write a good
+# question; it is not a decision surface.
+FIELD_DESCRIPTIONS = {
+    "fixed_commitments": "hard commitments (classes, meetings, appointments) "
+    "with exact times and days",
+    "rest_periods": "protected rest and recovery (sleep, breaks)",
+    "predictable_routines": "recurring daily activities (meals, laundry) and "
+    "when they usually happen",
+    "tasks": "specific tasks to schedule (study, work, errands) and deadlines",
+    "preferred_work_start": "the time the user's workday starts",
+    "preferred_work_end": "the time the user's workday ends",
+    "work_days": "which days of the week the user works",
+    "energy_peak": "when the user has the most energy (morning, afternoon, evening)",
+    "goals": "long-term goals the week should make progress on",
+    "habits": "existing habits or routines to preserve",
+    "challenges": "challenges or obstacles to plan around",
+    "notes": "anything else the user wants the planner to know",
+}
 
 SYSTEM_PROMPT = (
     "You are the consultation engine of LifePilot, a personal productivity "
@@ -59,41 +81,13 @@ SYSTEM_PROMPT = (
     "You always reply with exactly one JSON object and nothing else."
 )
 
-ANALYSIS_PROMPT = """Analyse the questionnaire below.
+CLASSIFY_PROMPT = """Classify the activities this user already mentioned.
 
 Questionnaire (JSON):
 {questionnaire}
 
-Understand this person's real week before trying to optimise it. Ask about
-missing information in this priority order, highest tier first:
-
-  P0  Hard commitments: classes, meetings, appointments - exact times and
-      weekdays.
-  P1  Rest and recovery: sleep, protected rest, regular breaks.
-  P2  Predictable routines: meals, laundry, other recurring daily activities,
-      and the time window they usually happen in.
-  P3  Uncertain tasks: studying, programming, reports, goals, deadlines, work
-      preferences.
-
-Question rules:
-- Never ask a lower-priority question while an important higher-priority gap
-  is still open. If P0 information is missing, only ask P0 questions.
-- Never ask about anything the questionnaire already answers.
-- Never ask two questions that would collect the same information.
-- At most {max_questions} questions. Fewer is better.
-- Each question must be answerable in one short sentence.
-- Never ask about medication timing. That may only come from the user.
-
-Task fields you may receive:
-- estimated_minutes is the user's own estimate. Treat it as a starting point,
-  never as a scheduling decision.
-- duration_type is either "predictable" or "uncertain". Respect it when
-  classifying: "predictable" maps to {predictable}, "uncertain" maps to
-  {uncertain}.
-
-Activity classification:
-- Classify the activities the user already mentioned into exactly one of
-  these categories: {categories}.
+Classify only the activities the user actually mentioned, into exactly one of
+these categories: {categories}.
 - Examples: Physics class -> {hard_commitment}; sleep -> {rest_period};
   lunch -> {predictable_routine}; studying calculus -> {uncertain_task}.
 - These are suggestions for the user to confirm, never confirmed facts.
@@ -105,10 +99,6 @@ Activity classification:
 
 Reply with exactly this JSON shape:
 {{
-  "follow_up_questions": [
-    {{"id": "q1", "question": "...", "priority": "P0",
-      "target_field": "fixed_commitments"}}
-  ],
   "activity_suggestions": [
     {{"activity_name": "...", "suggested_category": "{hard_commitment}",
       "reason": "...", "source_task_id": ""}}
@@ -116,14 +106,43 @@ Reply with exactly this JSON shape:
 }}
 
 JSON rules:
-- follow_up_questions: at most {max_questions}, ordered by priority.
-- priority must be one of {priorities}.
-- target_field names the questionnaire field the question fills in.
-- Return an empty list when nothing needs asking.
 - activity_suggestions: only activities the user actually mentioned.
 - suggested_category must be one of {categories}.
+- reason is required and must be one short sentence.
 - Omit "source_task_id" when the activity cannot be mapped to a task.
-- Return empty lists rather than omitting either key.
+- Return an empty list when there is nothing to classify.
+- Return raw JSON. No markdown fences, no commentary.
+"""
+
+PHRASE_PROMPT = """Write follow-up questions for the fields listed below.
+
+Questionnaire (JSON):
+{questionnaire}
+
+The consultation controller has already decided which fields to ask about.
+Do not add, remove, or reorder fields, and do not ask about anything else.
+For each field, write exactly one short, natural question the user can answer
+in a single sentence.
+
+Fields to ask about, highest priority first:
+{fields}
+
+Rules:
+- Keep each "target_field" exactly as listed (do not rename or paraphrase it).
+- Ask about nothing else.
+- Never ask about medication timing.
+- One question per field.
+
+Reply with exactly this JSON shape:
+{{
+  "follow_up_questions": [
+    {{"question": "...", "target_field": "fixed_commitments"}}
+  ]
+}}
+
+JSON rules:
+- Return one object per field, in the same order.
+- Return an empty list when no fields are listed.
 - Return raw JSON. No markdown fences, no commentary.
 """
 
@@ -143,8 +162,8 @@ Reply with exactly this JSON shape:
   "goals": ["..."],
   "work_style": "short description",
   "preferences": ["..."],
-  "recommended_work_block_minutes": 25,
-  "break_preferences": ["..."],
+  "recommended_work_block_minutes": {default_block},
+  "break_preferences": "a short note about breaks, or an empty string",
   "scheduling_notes": "practical notes for the scheduler"
 }}
 
@@ -153,6 +172,7 @@ Rules:
   reintroduce activities that were suggested earlier but not confirmed.
 - recommended_work_block_minutes must be an integer between
   {min_block} and {max_block}.
+- break_preferences is a single short string, not a list.
 - scheduling_notes may refer to fixed commitments as constraints, but must
   never restate them as a structured field.
 - Never output fixed_commitments. The scheduler reads those from the
@@ -161,29 +181,34 @@ Rules:
 """
 
 
-def render_analysis_prompt(questionnaire: str) -> str:
-    """Fill the analysis prompt with the category vocabulary of the moment.
-
-    A helper rather than ``str.format`` at the call site, because the same
-    four values appear in five places (ladder examples, JSON example, and the
-    allowed-values list) and they must never disagree.
-    """
+def render_classify_prompt(questionnaire: str) -> str:
+    """Fill the classification prompt with the category vocabulary of the moment."""
     categories = _categories()
-
-    return ANALYSIS_PROMPT.format(
+    return CLASSIFY_PROMPT.format(
         questionnaire=questionnaire,
-        max_questions=MAX_FOLLOW_UP_QUESTIONS,
         max_suggestions=MAX_ACTIVITY_SUGGESTIONS,
         categories=", ".join(categories),
-        priorities=", ".join(QUESTION_PRIORITIES),
         hard_commitment=categories[0],
         rest_period=categories[1],
         predictable_routine=categories[2],
         uncertain_task=categories[3],
-        predictable=categories[2],
-        # "uncertain" is both a duration_type and the prefix of a category,
-        # so it gets its own placeholder name.
-        uncertain=categories[3],
+    )
+
+
+def render_phrase_prompt(questionnaire: str, fields: list[dict]) -> str:
+    """Fill the phrasing prompt with the fields Python selected.
+
+    ``fields`` is a list of ``{"field": ..., "priority": "P0", "meaning": ...}``
+    already ordered by priority. It is rendered verbatim so the model phrases
+    in the same order and never invents extra fields.
+    """
+    lines = []
+    for item in fields:
+        meaning = item.get("meaning") or item.get("field")
+        lines.append(f'- {item["field"]} ({item["priority"]}): {meaning}')
+    return PHRASE_PROMPT.format(
+        questionnaire=questionnaire,
+        fields="\n".join(lines) if lines else "(none)",
     )
 
 
@@ -192,4 +217,4 @@ def _categories() -> tuple[str, ...]:
     values = tuple(ACTIVITY_CATEGORIES)
     if len(values) >= 4:
         return values[:4]
-    return values + _FALLBACK_CATEGORIES[len(values) :]
+    return values + _FALLBACK_CATEGORIES[len(values):]

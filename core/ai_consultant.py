@@ -1,55 +1,57 @@
-"""AI consultation logic for LifePilot (Core Models V1.1).
+"""AI consultation logic for LifePilot (Core Models V1.2).
 
-Three public functions, matching the contract agreed with the Technical Lead::
+The canonical interface is :class:`ConsultationController`, a stateful,
+multi-round controller. Python owns every decision; the LLM only phrases
+questions, classifies activities and writes the final profile.
 
-    start_consultation(questionnaire)                  -> ConsultationDraft (dict)
-    finalize_profile(confirmed_questionnaire, answers)  -> UserProfile (dict)
-    build_fallback_profile(questionnaire)               -> UserProfile (dict)
+Field states
+------------
+Every *required* questionnaire field belongs to exactly one of three states:
 
-ConsultationDraft::
+* ``resolved_fields``   - the field has confirmed information (a value, or an
+  explicitly confirmed empty answer such as "none").
+* ``unknown_fields``    - the user explicitly said they do not know / it does
+  not apply. This field must never be asked again; ``is_complete`` still
+  becomes ``True`` because consultation is over, but the frontend is expected
+  to surface the gap for manual completion.
+* ``unresolved_fields`` - no confirmed value yet; still eligible to be asked.
 
-    {
-        "follow_up_questions": [
-            {"id": "q1", "question": "..."},
-        ],
-        "activity_suggestions": [
-            {
-                "activity_name": "Physics class",
-                "suggested_category": "hard_commitment",
-                "reason": "...",
-                "source_task_id": "...",   # optional
-            },
-        ],
-    }
+``is_complete`` is derived from ``unresolved_fields`` (empty -> complete).
 
-UserProfile carries the seven content fields plus ``is_fallback``. The
-fallback flag exists only on the profile, never on the draft.
+Required vs optional fields
+---------------------------
+Required fields, in P0 -> P4 priority order (ask order, not importance):
 
-Two invariants drive the validation in this module:
+    P0  fixed_commitments
+    P1  rest_periods
+    P2  predictable_routines
+    P3  tasks, preferred_work_start, preferred_work_end, work_days, energy_peak
+    P4  goals
 
-* **Suggestions are not facts.** ``activity_suggestions`` never reaches
-  ``finalize_profile``'s prompt. Anything that looks like draft output is
-  stripped from the questionnaire before it is sent, so the model can only
-  reason about what the user confirmed.
-* **Order matters.** Follow-up questions are sorted P0 -> P3 before the
-  two-question cap is applied, so a lower-priority question can never
-  displace a higher-priority one.
+Optional contextual fields (``habits`` / ``challenges`` / ``notes``) are never
+asked about and never block completion.
 
-``core/models.py`` (owned by the Technical Lead) has not been pushed yet, so
-questionnaire and profile values are plain dictionaries here. Three details
-keep that temporary shape from leaking into the rest of the app:
+Answer classification
+---------------------
+Each answer to a follow-up question is classified as:
 
-* ``_as_mapping`` accepts dicts, dataclasses and pydantic models, so the real
-  ``QuestionnaireData`` can be swapped in without touching this module.
-* ``_jsonable`` recurses into nested ``TaskInput`` instances and enum values,
-  so ``estimated_minutes`` / ``duration_type`` / ``ActivityCategory`` arrive
-  in the prompt as data rather than as ``repr`` noise.
-* ``_normalise_profile`` guarantees every documented key exists with the
-  right type, so the scheduler can rely on the contract even when the model
-  returns something sloppy.
+* "resolved"  - any substantive answer, including an explicit "none"/"nothing"
+  (which counts as a confirmed empty value).
+* "unknown"   - an explicit "I don't know" / "not sure" / "doesn't apply".
+* "unresolved" - no answer given (empty / skipped); the field stays open.
 
-An API failure never propagates. Every public function degrades to a
-deterministic fallback.
+Rounds
+------
+At most two questions per round, deduplicated by ``target_field``. The total
+consultation is not limited to two questions; ``MAX_ROUNDS`` (12) is a safety
+ceiling after which no further questions are produced.
+
+Backward compatibility
+----------------------
+``start_consultation`` / ``finalize_profile`` / ``build_fallback_profile`` keep
+their V1.1 signatures and dictionary output shapes, so B's frontend keeps
+working unchanged. The typed models are used internally and surfaced through
+:class:`ConsultationController`.
 """
 
 from __future__ import annotations
@@ -61,8 +63,17 @@ from enum import Enum
 from typing import Any, Mapping
 
 from core.ai_client import AIError, DeepSeekClient
+from core.models import (
+    ActivityCategory,
+    ActivitySuggestion,
+    ConsultationDraft,
+    FollowUpQuestion,
+    UserProfile,
+)
 from core.prompts import (
     ACTIVITY_CATEGORIES,
+    DEFAULT_WORK_BLOCK_MINUTES,
+    FIELD_DESCRIPTIONS,
     MAX_ACTIVITY_SUGGESTIONS,
     MAX_FOLLOW_UP_QUESTIONS,
     MAX_WORK_BLOCK_MINUTES,
@@ -70,21 +81,27 @@ from core.prompts import (
     PROFILE_PROMPT,
     QUESTION_PRIORITIES,
     SYSTEM_PROMPT,
-    render_analysis_prompt,
+    render_classify_prompt,
+    render_phrase_prompt,
 )
 
 __all__ = [
     "ACTIVITY_CATEGORIES",
-    "DURATION_TYPES",
     "DRAFT_KEYS",
-    "FOLLOW_UP_IDS",
+    "DURATION_TYPES",
+    "MAX_ROUNDS",
     "MEDICATION_KEYWORDS",
+    "OPTIONAL_FIELDS",
     "PROFILE_KEYS",
     "QUESTION_PRIORITIES",
+    "REQUIRED_FIELDS",
+    "ConsultationController",
     "build_fallback_profile",
     "finalize_profile",
     "start_consultation",
 ]
+
+MAX_ROUNDS = 12
 
 # The keys every UserProfile must carry, including the fallback marker.
 # fixed_commitments is deliberately absent: the scheduler reads it straight
@@ -100,11 +117,43 @@ PROFILE_KEYS = (
     "is_fallback",
 )
 
-# The keys every ConsultationDraft must carry.
-DRAFT_KEYS = ("follow_up_questions", "activity_suggestions")
+# The keys every ConsultationDraft carries (V1.2 field-state model).
+DRAFT_KEYS = (
+    "follow_up_questions",
+    "activity_suggestions",
+    "resolved_fields",
+    "unknown_fields",
+    "unresolved_fields",
+)
 
-# Answer keys must match the ids emitted by start_consultation, in order.
-FOLLOW_UP_IDS = ("q1", "q2")
+# Required questionnaire fields, ordered by ask priority P0 -> P4.
+REQUIRED_FIELDS = (
+    "fixed_commitments",       # P0
+    "rest_periods",            # P1
+    "predictable_routines",    # P2
+    "tasks",                   # P3
+    "preferred_work_start",    # P3
+    "preferred_work_end",      # P3
+    "work_days",               # P3
+    "energy_peak",             # P3
+    "goals",                   # P4
+)
+
+# Optional contextual fields: never asked about, never block completion.
+OPTIONAL_FIELDS = ("habits", "challenges", "notes")
+
+# Field -> priority tier (0 = P0 ... 4 = P4). Lower asks first.
+FIELD_PRIORITY = {
+    "fixed_commitments": 0,
+    "rest_periods": 1,
+    "predictable_routines": 2,
+    "tasks": 3,
+    "preferred_work_start": 3,
+    "preferred_work_end": 3,
+    "work_days": 3,
+    "energy_peak": 3,
+    "goals": 4,
+}
 
 # The two values TaskInput.duration_type may take. Only used to read a
 # questionnaire that already carries them; never written back.
@@ -113,25 +162,18 @@ DURATION_TYPES = ("predictable", "uncertain")
 # Keys that only ever belong to a draft. If a caller accidentally forwards a
 # draft (or a contaminated dict) into profile generation, these are dropped so
 # that unconfirmed suggestions can never be treated as user facts.
-DRAFT_ARTEFACT_KEYS = ("follow_up_questions", "activity_suggestions", "is_fallback")
-
-# Questionnaire fields whose presence means a question targeting them would
-# be repeating information the user already supplied.
-QUESTIONNAIRE_FIELDS = (
-    "goals",
-    "tasks",
-    "fixed_commitments",
-    "preferred_work_hours",
-    "work_style",
-    "preferences",
+DRAFT_ARTEFACT_KEYS = (
+    "follow_up_questions",
+    "activity_suggestions",
+    "resolved_fields",
+    "unknown_fields",
+    "unresolved_fields",
+    "is_fallback",
 )
-
-DEFAULT_WORK_BLOCK_MINUTES = 25
 
 # Categories the model may abbreviate. Keys are normalised (lowercase,
 # underscores); anything not listed and not an exact category is rejected
-# rather than mapped onto a nearest guess, because a wrong classification
-# would become a wrong schedule.
+# rather than mapped onto a nearest guess.
 CATEGORY_ALIASES = {
     "hard": "hard_commitment",
     "commitment": "hard_commitment",
@@ -155,6 +197,30 @@ MEDICATION_KEYWORDS = (
     "药",
 )
 
+# Explicit "I don't know" signals. A matching answer moves the field to the
+# unknown state and guarantees it is never asked again.
+UNKNOWN_ANSWER_MARKERS = (
+    "dont know",
+    "don't know",
+    "do not know",
+    "not sure",
+    "unsure",
+    "no idea",
+    "dont remember",
+    "don't remember",
+    "does not apply",
+    "doesn't apply",
+    "not applicable",
+    "unknown",
+    "idk",
+    "不知道",
+    "不清楚",
+    "不确定",
+    "没想好",
+    "不适用",
+    "忘了",
+)
+
 # Clock times, in the two shapes a model actually produces: 08:00 / 8:00 and
 # "8am" / "8 pm".
 _TIME_PATTERN = re.compile(
@@ -162,10 +228,213 @@ _TIME_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# A follow-up answer id is "q" followed by a positive integer, with no limit.
+_ANSWER_ID_PATTERN = re.compile(r"q[1-9]\d*")
+
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+
+class ConsultationController:
+    """Stateful multi-round consultation (canonical V1.2 interface).
+
+    Construct with the questionnaire, call :meth:`next_round` to get a
+    :class:`ConsultationDraft`, collect answers, then :meth:`apply_answers`.
+    Repeat until :attr:`is_complete`. The state is explicitly serializable via
+    :meth:`to_state` / :meth:`from_state` for storage in Streamlit session
+    state; no module-level global state is used.
+
+    The questionnaire is stored stripped of draft artefacts. The client is
+    resolved eagerly from ``client`` or ``api_key``, but the underlying SDK
+    client stays lazy.
+    """
+
+    def __init__(
+        self,
+        questionnaire: Any,
+        client: DeepSeekClient | None = None,
+        api_key: str | None = None,
+        max_rounds: int = MAX_ROUNDS,
+    ) -> None:
+        self.questionnaire = _strip_draft_artefacts(_as_mapping(questionnaire))
+        self.client = client or DeepSeekClient(api_key=api_key)
+        self.max_rounds = max_rounds
+
+        self.round_count = 0
+        self.resolved, self.unknown, self.unresolved = _initial_field_states(
+            self.questionnaire
+        )
+        self._suggestions: list[ActivitySuggestion] | None = None
+        self._question_targets: dict[str, str] = {}
+        self._answers: dict[str, str] = {}
+        self._question_seq = 0
+        self._pending: list[FollowUpQuestion] = []
+
+    # -- read-only state ----------------------------------------------------
+
+    @property
+    def is_complete(self) -> bool:
+        """True when no required field is still unresolved."""
+        return len(self.unresolved) == 0
+
+    # -- driving the consultation ------------------------------------------
+
+    def next_round(self) -> ConsultationDraft:
+        """Return the draft for the next round, asking <= 2 new questions.
+
+        If questions were already asked this round and not yet answered, the
+        same questions are returned (idempotent for Streamlit reruns).
+        """
+        suggestions = self._ensure_suggestions()
+        if self._pending:
+            questions = list(self._pending)
+        elif self.is_complete or self.round_count >= self.max_rounds:
+            questions = []
+        else:
+            fields = self._select_fields()
+            questions = self._phrase(fields)
+            self._pending = list(questions)
+        return self._build_draft(questions, suggestions)
+
+    def apply_answers(self, answers: Any) -> None:
+        """Apply this round's answers and advance the round counter."""
+        mapping = _as_mapping(answers)
+        self.round_count += 1
+        for question in self._pending:
+            if question.id not in mapping:
+                continue  # skipped -> field stays unresolved
+            text = _as_text(mapping[question.id])
+            self._answers[question.id] = text
+            self._transition(question.target_field, _classify_answer(text))
+        self._pending = []
+
+    # -- serialization ------------------------------------------------------
+
+    def to_state(self) -> dict:
+        """Return a JSON-friendly snapshot for Streamlit session state."""
+        return {
+            "round_count": self.round_count,
+            "resolved_fields": self._sorted(self.resolved),
+            "unknown_fields": self._sorted(self.unknown),
+            "unresolved_fields": self._sorted(self.unresolved),
+            "question_targets": dict(self._question_targets),
+            "answers": dict(self._answers),
+            "question_seq": self._question_seq,
+            "pending": [self._question_to_dict(q) for q in self._pending],
+        }
+
+    @classmethod
+    def from_state(
+        cls,
+        state: Mapping[str, Any],
+        questionnaire: Any,
+        client: DeepSeekClient | None = None,
+        api_key: str | None = None,
+    ) -> "ConsultationController":
+        """Reconstruct a controller from :meth:`to_state` output."""
+        controller = cls(questionnaire, client=client, api_key=api_key)
+        controller.round_count = int(state.get("round_count", 0))
+        controller.resolved = list(state.get("resolved_fields", []))
+        controller.unknown = list(state.get("unknown_fields", []))
+        controller.unresolved = list(state.get("unresolved_fields", []))
+        controller._question_targets = dict(state.get("question_targets", {}))
+        controller._answers = dict(state.get("answers", {}))
+        controller._question_seq = int(state.get("question_seq", 0))
+        controller._pending = [
+            FollowUpQuestion(**item) for item in state.get("pending", [])
+        ]
+        return controller
+
+    # -- internals ----------------------------------------------------------
+
+    def _select_fields(self) -> list[str]:
+        fields = sorted(
+            self.unresolved, key=lambda field: (FIELD_PRIORITY.get(field, 9), field)
+        )
+        return fields[:MAX_FOLLOW_UP_QUESTIONS]
+
+    def _ensure_suggestions(self) -> list[ActivitySuggestion]:
+        if self._suggestions is None:
+            self._suggestions = _classify_activities(self.questionnaire, self.client)
+        return list(self._suggestions)
+
+    def _phrase(self, fields: list[str]) -> list[FollowUpQuestion]:
+        selected = [
+            {
+                "field": field,
+                "priority": QUESTION_PRIORITIES[FIELD_PRIORITY.get(field, 4)],
+                "meaning": FIELD_DESCRIPTIONS.get(field, field),
+            }
+            for field in fields
+        ]
+        prompt = render_phrase_prompt(_as_json(self.questionnaire), selected)
+        try:
+            payload = self.client.chat_json(
+                [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ]
+            )
+        except AIError:
+            return []
+
+        source = payload if isinstance(payload, Mapping) else {}
+        texts = _extract_question_texts(source.get("follow_up_questions"))
+
+        questions: list[FollowUpQuestion] = []
+        for field in fields:
+            text = texts.get(field)
+            if not text:
+                continue
+            self._question_seq += 1
+            question_id = f"q{self._question_seq}"
+            self._question_targets[question_id] = field
+            questions.append(
+                FollowUpQuestion(
+                    id=question_id,
+                    question=text,
+                    target_field=field,
+                    priority=FIELD_PRIORITY.get(field, 2),
+                )
+            )
+        return questions
+
+    def _transition(self, field: str, label: str) -> None:
+        if label == "unresolved":
+            return
+        if field in self.unresolved:
+            self.unresolved.remove(field)
+        target = self.unknown if label == "unknown" else self.resolved
+        if field not in target:
+            target.append(field)
+
+    def _build_draft(
+        self,
+        questions: list[FollowUpQuestion],
+        suggestions: list[ActivitySuggestion],
+    ) -> ConsultationDraft:
+        return ConsultationDraft(
+            follow_up_questions=questions,
+            activity_suggestions=suggestions,
+            resolved_fields=self._sorted(self.resolved),
+            unknown_fields=self._sorted(self.unknown),
+            unresolved_fields=self._sorted(self.unresolved),
+        )
+
+    @staticmethod
+    def _sorted(fields: list[str]) -> list[str]:
+        return sorted(fields, key=lambda field: (FIELD_PRIORITY.get(field, 9), field))
+
+    @staticmethod
+    def _question_to_dict(question: FollowUpQuestion) -> dict[str, Any]:
+        return {
+            "id": question.id,
+            "question": question.question,
+            "target_field": question.target_field,
+            "priority": question.priority,
+        }
 
 
 def start_consultation(
@@ -173,40 +442,28 @@ def start_consultation(
     client: DeepSeekClient | None = None,
     api_key: str | None = None,
 ) -> dict[str, Any]:
-    """Stage one: propose 0-2 follow-ups and classify known activities.
+    """Legacy stage one: propose the first round's follow-ups and classify.
 
-    Returns ``{"follow_up_questions": [...], "activity_suggestions": [...]}``.
+    Backward-compatible wrapper. Returns the V1.1 dictionary shape::
 
-    Question ids are reassigned here (``q1``, ``q2``) rather than trusted from
-    the model, so they always match the answer keys ``finalize_profile``
-    expects. The same applies to ordering and duplicates: the model's list is
-    sorted by priority, de-duplicated and truncated before it is returned.
+        {"follow_up_questions": [{"id", "question"}, ...],
+         "activity_suggestions": [...]}
 
-    When the API is unavailable both lists are empty, which tells the caller
-    to skip the follow-up screen and go straight to ``finalize_profile``.
+    Internally it runs :class:`ConsultationController` once, so priority and
+    field selection are owned by Python, not the model. When the API is
+    unavailable both lists are empty.
     """
-    data = _as_mapping(questionnaire)
-    active_client = client or DeepSeekClient(api_key=api_key)
-
-    try:
-        payload = active_client.chat_json(
-            [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": render_analysis_prompt(_as_json(data))},
-            ]
-        )
-    except AIError:
-        return _empty_draft()
-
-    source = payload if isinstance(payload, Mapping) else {}
-
+    controller = ConsultationController(questionnaire, client=client, api_key=api_key)
+    draft = controller.next_round()
     return {
-        "follow_up_questions": _normalise_questions(
-            source.get("follow_up_questions"), data
-        ),
-        "activity_suggestions": _normalise_activities(
-            source.get("activity_suggestions"), data
-        ),
+        "follow_up_questions": [
+            {"id": question.id, "question": question.question}
+            for question in draft.follow_up_questions
+        ],
+        "activity_suggestions": [
+            _suggestion_to_dict(suggestion)
+            for suggestion in draft.activity_suggestions
+        ],
     }
 
 
@@ -218,18 +475,11 @@ def finalize_profile(
     *,
     confirmed_questionnaire: Any = None,
 ) -> dict[str, Any]:
-    """Stage two: turn the confirmed questionnaire plus answers into a profile.
+    """Legacy stage two: turn confirmed information into a profile dictionary.
 
-    ``follow_up_answers`` is keyed by question id (``q1``/``q2``) and may be
-    empty when stage one produced no question. Every returned profile carries
-    ``is_fallback``; callers should surface a notice to the user when it is
-    ``True``.
-
-    ``questionnaire`` and ``confirmed_questionnaire`` are the same argument
-    under two names, so the caller can use whichever reads better. Anything
-    that looks like draft output (suggestions, questions, a fallback flag) is
-    stripped before the prompt is built: only confirmed user information may
-    reach the model here.
+    Backward-compatible wrapper returning the V1.1 eight-key dictionary shape
+    (``break_preferences`` is now a string, matching the V1.2 model). Anything
+    that looks like draft output is stripped first.
     """
     source = questionnaire if questionnaire is not None else confirmed_questionnaire
     data = _strip_draft_artefacts(_as_mapping(source))
@@ -241,6 +491,7 @@ def finalize_profile(
         follow_up_answers=_as_json(answers),
         min_block=MIN_WORK_BLOCK_MINUTES,
         max_block=MAX_WORK_BLOCK_MINUTES,
+        default_block=DEFAULT_WORK_BLOCK_MINUTES,
     )
 
     try:
@@ -251,133 +502,126 @@ def finalize_profile(
             ]
         )
     except AIError:
-        return build_fallback_profile(data)
+        profile = _build_fallback_profile(data)
+    else:
+        profile = _normalise_profile(payload, data)
 
-    return _normalise_profile(payload, data)
+    return _profile_to_dict(profile)
 
 
 def build_fallback_profile(questionnaire: Any) -> dict[str, Any]:
-    """Deterministic profile built only from what the user explicitly said.
+    """Legacy deterministic profile, built only from explicit user input.
 
-    Nothing here is generated: goals, preferences and work style are copied
-    from the questionnaire, and the work block length is the documented
-    default, labelled as such. This function makes no network call, so it
-    always succeeds. Draft artefacts are stripped first, so an unconfirmed
-    suggestion can never be promoted to a stated preference by falling back.
+    Returns the V1.1 eight-key dictionary shape. No network call, so it always
+    succeeds. Draft artefacts are stripped first.
     """
     data = _strip_draft_artefacts(_as_mapping(questionnaire))
-
-    goals = _clean_list(data.get("goals"))
-    preferences = _clean_list(data.get("preferences"))
-    work_style = _as_text(data.get("work_style"))
-    break_preferences = _clean_list(data.get("break_preferences"))
-
-    # The questionnaire has no field for a block length, so any number derived
-    # from free text would be an invented preference. Use the documented
-    # default and label it as such instead.
-    block_minutes = DEFAULT_WORK_BLOCK_MINUTES
-
-    notes = [
-        "Generated without AI because the consultation service was unavailable.",
-        "Only information supplied in the questionnaire was used.",
-        f"The {block_minutes}-minute work block is a system default, "
-        "not a user preference.",
-    ]
-    if _clean_list(data.get("fixed_commitments")):
-        notes.append(
-            "Fixed commitments come from the questionnaire and were not modified."
-        )
-
-    return {
-        "summary": _fallback_summary(goals, work_style),
-        "goals": goals,
-        "work_style": work_style,
-        "preferences": preferences,
-        "recommended_work_block_minutes": block_minutes,
-        "break_preferences": break_preferences,
-        "scheduling_notes": " ".join(notes),
-        "is_fallback": True,
-    }
+    return _profile_to_dict(_build_fallback_profile(data))
 
 
 # ---------------------------------------------------------------------------
-# Draft normalisation
+# Question extraction and phrasing (Python-owned)
 # ---------------------------------------------------------------------------
 
 
-def _empty_draft() -> dict[str, list]:
-    """A valid draft with nothing in it, used when the API is unavailable."""
-    return {"follow_up_questions": [], "activity_suggestions": []}
+def _extract_question_texts(raw: Any) -> dict[str, str]:
+    """Map ``target_field -> question`` from a model reply, first one wins.
 
-
-def _normalise_questions(
-    raw: Any,
-    questionnaire: Mapping[str, Any],
-) -> list[dict[str, str]]:
-    """Coerce a model reply into the agreed question shape.
-
-    Accepts ``{"id", "question", "priority", "target_field"}`` objects, or
-    bare strings for sloppy replies. Four steps, in this order:
-
-    1. drop questions that would re-ask a questionnaire field already filled,
-    2. drop duplicate wording,
-    3. sort by priority so P0 comes first,
-    4. cap at two and reassign ids ``q1``/``q2``.
-
-    The returned objects carry only ``id`` and ``question``: priority is an
-    internal ordering device, not part of the UI contract.
+    Bare strings are ignored in V1.2: a question without a ``target_field``
+    cannot be mapped to a field, so it is discarded rather than guessed.
     """
+    result: dict[str, str] = {}
     if not isinstance(raw, (list, tuple)):
+        return result
+    for item in raw:
+        if not isinstance(item, Mapping):
+            continue
+        target = _as_text(item.get("target_field")) or _as_text(item.get("target"))
+        text = _as_text(item.get("question")) or _as_text(item.get("text"))
+        if target and text and target not in result:
+            result[target] = text
+    return result
+
+
+def _classify_activities(
+    questionnaire: Mapping[str, Any],
+    client: DeepSeekClient,
+) -> list[ActivitySuggestion]:
+    """Classify the activities the user mentioned (LLM responsibility only)."""
+    try:
+        payload = client.chat_json(
+            [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": render_classify_prompt(_as_json(questionnaire))},
+            ]
+        )
+    except AIError:
         return []
+    source = payload if isinstance(payload, Mapping) else {}
+    return _normalise_activities(source.get("activity_suggestions"), questionnaire)
 
-    answered = _answered_fields(questionnaire)
-    candidates: list[dict[str, Any]] = []
 
-    for index, item in enumerate(raw):
-        if isinstance(item, Mapping):
-            text = _as_text(item.get("question")) or _as_text(item.get("text"))
-            priority = _normalise_priority(item.get("priority"))
-            target = _as_text(item.get("target_field")) or _as_text(item.get("target"))
+# ---------------------------------------------------------------------------
+# Field state (Python-owned)
+# ---------------------------------------------------------------------------
+
+
+def _initial_field_states(
+    questionnaire: Mapping[str, Any],
+) -> tuple[list[str], list[str], list[str]]:
+    """Derive (resolved, unknown, unresolved) from the questionnaire.
+
+    A required field is resolved when it carries content; ``energy_peak`` is
+    only resolved when it is a real value (not the ``"unknown"`` placeholder).
+    Optional fields are ignored entirely.
+    """
+    resolved: list[str] = []
+    unresolved: list[str] = []
+    for field in REQUIRED_FIELDS:
+        if _field_filled(questionnaire, field):
+            resolved.append(field)
         else:
-            text = _as_text(item)
-            priority = QUESTION_PRIORITIES[-1]
-            target = ""
+            unresolved.append(field)
+    return resolved, [], unresolved
 
-        if not text:
-            continue
 
-        # A question that names a field the user already filled is, by
-        # definition, a repeat. Drop it rather than trusting the model to
-        # have noticed.
-        if target and target in answered:
-            continue
+def _field_filled(questionnaire: Mapping[str, Any], field: str) -> bool:
+    value = questionnaire.get(field)
+    if field == "energy_peak":
+        return _has_content(value) and _as_text(value).lower() != "unknown"
+    return _has_content(value)
 
-        key = _dedupe_key(text)
-        if not key or any(key == candidate["key"] for candidate in candidates):
-            continue
 
-        candidates.append(
-            {"text": text, "priority": priority, "key": key, "index": index}
-        )
+def _classify_answer(text: str) -> str:
+    """Classify an answer as "resolved", "unknown", or "unresolved".
 
-    candidates.sort(
-        key=lambda candidate: (
-            QUESTION_PRIORITIES.index(candidate["priority"]),
-            candidate["index"],
-        )
-    )
+    * blank -> "unresolved" (no answer given; field stays open).
+    * explicit don't-know / doesn't-apply -> "unknown" (never ask again).
+    * anything else -> "resolved", including "none"/"nothing" which count as a
+      confirmed empty value.
+    """
+    value = _as_text(text)
+    if not value:
+        return "unresolved"
+    lowered = value.lower()
+    if lowered in ("?", "？？", "???", "n/a", "na"):
+        return "unknown"
+    for marker in UNKNOWN_ANSWER_MARKERS:
+        if marker in lowered:
+            return "unknown"
+    return "resolved"
 
-    return [
-        {"id": FOLLOW_UP_IDS[position], "question": candidate["text"]}
-        for position, candidate in enumerate(candidates[:MAX_FOLLOW_UP_QUESTIONS])
-    ]
+
+# ---------------------------------------------------------------------------
+# Activity normalisation
+# ---------------------------------------------------------------------------
 
 
 def _normalise_activities(
     raw: Any,
     questionnaire: Mapping[str, Any],
-) -> list[dict[str, str]]:
-    """Coerce classified activities into the agreed suggestion shape.
+) -> list[ActivitySuggestion]:
+    """Coerce classified activities into typed :class:`ActivitySuggestion`.
 
     Only the four documented categories survive; an unrecognised category is
     discarded rather than mapped onto a nearest guess. Suggestions are capped,
@@ -387,10 +631,8 @@ def _normalise_activities(
     if not isinstance(raw, (list, tuple)):
         return []
 
-    # Everything the user actually wrote, lowercased, used to decide whether
-    # a time in a reason was quoted from the questionnaire or invented.
     user_text = _as_json(questionnaire).lower()
-    suggestions: list[dict[str, str]] = []
+    suggestions: list[ActivitySuggestion] = []
     seen: set[tuple[str, str]] = set()
 
     for item in raw:
@@ -405,61 +647,41 @@ def _normalise_activities(
         if not name:
             continue
 
-        category = _normalise_category(
+        category_value = _normalise_category(
             item.get("suggested_category") or item.get("category")
         )
-        if category is None:
+        if category_value is None:
             continue
 
         reason = _guard_medication_timing(
             name, _as_text(item.get("reason")), user_text
         )
-        key = (_dedupe_key(name), category)
+        if not reason:
+            reason = "Mentioned in the questionnaire."
+
+        key = (_dedupe_key(name), category_value)
         if key in seen:
             continue
         seen.add(key)
 
-        suggestion: dict[str, str] = {
-            "activity_name": name,
-            "suggested_category": category,
-            "reason": reason,
-        }
         source_id = _as_text(item.get("source_task_id")) or _as_text(
             item.get("task_id")
         )
-        if source_id:
-            suggestion["source_task_id"] = source_id
 
-        suggestions.append(suggestion)
+        suggestions.append(
+            ActivitySuggestion(
+                activity_name=name,
+                suggested_category=ActivityCategory(category_value),
+                reason=reason,
+                source_task_id=source_id or None,
+            )
+        )
 
     return suggestions
 
 
-def _normalise_priority(value: Any) -> str:
-    """Map a model-supplied priority onto ``P0``-``P3``.
-
-    Unknown or missing values fall to the lowest tier, which means they lose
-    every tie against a real priority once the list is sorted and capped.
-    """
-    text = _as_text(value).upper().replace(" ", "")
-    if text.startswith("PRIORITY"):
-        text = text[len("PRIORITY") :]
-    text = text.lstrip("P").lstrip("_:-")
-
-    for index in range(len(QUESTION_PRIORITIES)):
-        if text.startswith(str(index)):
-            return QUESTION_PRIORITIES[index]
-
-    return QUESTION_PRIORITIES[-1]
-
-
 def _normalise_category(value: Any) -> str | None:
-    """Return one of the four category values, or ``None`` when unrecognisable.
-
-    Accepts the enum itself (``ActivityCategory.hard_commitment``), the plain
-    string (``"hard_commitment"``), and the shouty or spaced variants a model
-    sometimes emits (``"HARD_COMMITMENT"``, ``"hard-commitment"``).
-    """
+    """Return one of the four category values, or ``None`` when unrecognisable."""
     if isinstance(value, Enum):
         value = value.value
 
@@ -472,12 +694,7 @@ def _normalise_category(value: Any) -> str | None:
 
 
 def _guard_medication_timing(name: str, reason: str, user_text: str) -> str:
-    """Remove clock times the user never gave, for medication-like activities.
-
-    The AI must never decide when someone takes their medicine. Any time in a
-    medication reason that does not appear verbatim in the questionnaire is
-    replaced with a placeholder the user has to fill in.
-    """
+    """Remove clock times the user never gave, for medication-like activities."""
     if not reason:
         return reason
     if not any(word in name.lower() for word in MEDICATION_KEYWORDS):
@@ -496,11 +713,13 @@ def _guard_medication_timing(name: str, reason: str, user_text: str) -> str:
 
 
 def _clean_answers(answers: Any) -> dict[str, str]:
-    """Keep only recognised question ids with non-empty answers."""
+    """Keep only recognised question ids (q1..qn) with non-empty answers."""
     mapping = _as_mapping(answers)
     cleaned: dict[str, str] = {}
-    for question_id in FOLLOW_UP_IDS:
-        text = _as_text(mapping.get(question_id))
+    for question_id, value in mapping.items():
+        if not _ANSWER_ID_PATTERN.fullmatch(str(question_id)):
+            continue
+        text = _as_text(value)
         if text:
             cleaned[question_id] = text
     return cleaned
@@ -509,35 +728,64 @@ def _clean_answers(answers: Any) -> dict[str, str]:
 def _normalise_profile(
     payload: Mapping[str, Any],
     questionnaire: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Force a model reply into the documented profile shape.
-
-    Anything the model returns outside ``PROFILE_KEYS`` is dropped, which is
-    what keeps a stray ``fixed_commitments`` key from ever reaching the
-    scheduler.
-    """
+) -> UserProfile:
+    """Force a model reply into a typed :class:`UserProfile`."""
     source = payload if isinstance(payload, Mapping) else {}
 
-    block, _ = _coerce_minutes(source.get("recommended_work_block_minutes"))
+    goals = _clean_list(source.get("goals")) or _clean_list(questionnaire.get("goals"))
+    work_style = _as_text(source.get("work_style")) or _as_text(
+        questionnaire.get("work_style")
+    )
+    preferences = _clean_list(source.get("preferences")) or _clean_list(
+        questionnaire.get("preferences")
+    )
+    summary = _as_text(source.get("summary"))
+    if not summary:
+        summary = _fallback_summary(goals, work_style)
 
-    profile: dict[str, Any] = {
-        "summary": _as_text(source.get("summary")),
-        "goals": _clean_list(source.get("goals"))
-        or _clean_list(questionnaire.get("goals")),
-        "work_style": _as_text(source.get("work_style"))
-        or _as_text(questionnaire.get("work_style")),
-        "preferences": _clean_list(source.get("preferences"))
-        or _clean_list(questionnaire.get("preferences")),
-        "recommended_work_block_minutes": block,
-        "break_preferences": _clean_list(source.get("break_preferences")),
-        "scheduling_notes": _as_text(source.get("scheduling_notes")),
-        "is_fallback": False,
-    }
+    return UserProfile(
+        summary=summary,
+        goals=goals,
+        work_style=work_style,
+        preferences=preferences,
+        recommended_work_block_minutes=_coerce_block_minutes(
+            source.get("recommended_work_block_minutes")
+        ),
+        break_preferences=_coerce_break_preferences(source.get("break_preferences")),
+        scheduling_notes=_as_text(source.get("scheduling_notes")),
+        is_fallback=False,
+    )
 
-    if not profile["summary"]:
-        profile["summary"] = _fallback_summary(profile["goals"], profile["work_style"])
 
-    return profile
+def _build_fallback_profile(questionnaire: Mapping[str, Any]) -> UserProfile:
+    """Deterministic typed profile built only from explicit user input."""
+    goals = _clean_list(questionnaire.get("goals"))
+    preferences = _clean_list(questionnaire.get("preferences"))
+    work_style = _as_text(questionnaire.get("work_style"))
+    break_preferences = _coerce_break_preferences(questionnaire.get("break_preferences"))
+    block_minutes = DEFAULT_WORK_BLOCK_MINUTES
+
+    notes = [
+        "Generated without AI because the consultation service was unavailable.",
+        "Only information supplied in the questionnaire was used.",
+        f"The {block_minutes}-minute work block is a system default, "
+        "not a user preference.",
+    ]
+    if _has_content(questionnaire.get("fixed_commitments")):
+        notes.append(
+            "Fixed commitments come from the questionnaire and were not modified."
+        )
+
+    return UserProfile(
+        summary=_fallback_summary(goals, work_style),
+        goals=goals,
+        work_style=work_style,
+        preferences=preferences,
+        recommended_work_block_minutes=block_minutes,
+        break_preferences=break_preferences,
+        scheduling_notes=" ".join(notes),
+        is_fallback=True,
+    )
 
 
 def _fallback_summary(goals: list[str], work_style: str) -> str:
@@ -552,17 +800,56 @@ def _fallback_summary(goals: list[str], work_style: str) -> str:
     return " ".join(parts)
 
 
-def _coerce_minutes(value: Any) -> tuple[int, bool]:
-    """Coerce a model value into a bounded integer work block length."""
+def _coerce_block_minutes(value: Any) -> int:
+    """Coerce a model value into a bounded work block length (default 50)."""
     try:
         minutes = int(value)
     except (TypeError, ValueError):
-        return DEFAULT_WORK_BLOCK_MINUTES, True
+        return DEFAULT_WORK_BLOCK_MINUTES
 
     if minutes < MIN_WORK_BLOCK_MINUTES or minutes > MAX_WORK_BLOCK_MINUTES:
-        return DEFAULT_WORK_BLOCK_MINUTES, True
+        return DEFAULT_WORK_BLOCK_MINUTES
+    return minutes
 
-    return minutes, False
+
+def _coerce_break_preferences(value: Any) -> str:
+    """Coerce break preferences into the V1.2 string shape."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (list, tuple, set)):
+        return ", ".join(_clean_list(value))
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Dictionary shims for the legacy wrappers
+# ---------------------------------------------------------------------------
+
+
+def _suggestion_to_dict(suggestion: ActivitySuggestion) -> dict[str, str]:
+    result: dict[str, str] = {
+        "activity_name": suggestion.activity_name,
+        "suggested_category": suggestion.suggested_category.value,
+        "reason": suggestion.reason,
+    }
+    if suggestion.source_task_id:
+        result["source_task_id"] = suggestion.source_task_id
+    return result
+
+
+def _profile_to_dict(profile: UserProfile) -> dict[str, Any]:
+    return {
+        "summary": profile.summary,
+        "goals": list(profile.goals),
+        "work_style": profile.work_style,
+        "preferences": list(profile.preferences),
+        "recommended_work_block_minutes": profile.recommended_work_block_minutes,
+        "break_preferences": profile.break_preferences,
+        "scheduling_notes": profile.scheduling_notes,
+        "is_fallback": profile.is_fallback,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -576,15 +863,6 @@ def _strip_draft_artefacts(questionnaire: Mapping[str, Any]) -> dict[str, Any]:
         key: value
         for key, value in questionnaire.items()
         if key not in DRAFT_ARTEFACT_KEYS
-    }
-
-
-def _answered_fields(questionnaire: Mapping[str, Any]) -> set[str]:
-    """Return the questionnaire fields the user has already filled in."""
-    return {
-        field
-        for field in QUESTIONNAIRE_FIELDS
-        if _has_content(questionnaire.get(field))
     }
 
 
@@ -607,11 +885,7 @@ def _dedupe_key(text: str) -> str:
 
 
 def _as_mapping(value: Any) -> dict[str, Any]:
-    """Coerce questionnaire-like input into a plain dictionary.
-
-    Accepts dicts today and dataclass / pydantic models once ``core.models``
-    lands, so the interface does not have to change later.
-    """
+    """Coerce questionnaire-like input into a plain dictionary."""
     if value is None:
         return {}
     if isinstance(value, dict):
@@ -637,13 +911,7 @@ def _as_mapping(value: Any) -> dict[str, Any]:
 
 
 def _jsonable(value: Any) -> Any:
-    """Convert a questionnaire into something ``json.dumps`` renders readably.
-
-    ``_as_mapping`` only converts the top level. A ``QuestionnaireData`` holds
-    ``list[TaskInput]``, and ``TaskInput`` holds ``estimated_minutes`` and a
-    ``duration_type`` enum, so the recursion below is what keeps those fields
-    visible to the model instead of collapsing into ``repr`` strings.
-    """
+    """Convert a questionnaire into something ``json.dumps`` renders readably."""
     if isinstance(value, Enum):
         return value.value
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
@@ -680,13 +948,7 @@ def _as_text(value: Any) -> str:
 
 
 def _clean_list(value: Any) -> list[str]:
-    """Return a list of non-empty trimmed strings.
-
-    A bare string is treated as a single-item list, because models sometimes
-    collapse a one-element array into a scalar. Dicts are rendered as their
-    ``name``/``title``/``label`` value when present, so a questionnaire that
-    supplies tasks as objects still yields readable goal text.
-    """
+    """Return a list of non-empty trimmed strings."""
     if value is None:
         return []
     if isinstance(value, str):
@@ -703,13 +965,7 @@ def _clean_list(value: Any) -> list[str]:
 
 
 def _display_text(item: Any) -> str:
-    """Render one list entry as readable text.
-
-    Once ``core.models`` lands, questionnaire lists may hold model instances
-    rather than strings. Falling back to ``repr`` would put
-    ``TaskInput(name='Read', estimated_minutes=60)`` into a user-facing
-    summary, so the obvious label fields are tried first.
-    """
+    """Render one list entry as readable text."""
     if isinstance(item, Mapping):
         for key in ("name", "title", "label", "text", "description", "goal"):
             text = _as_text(item.get(key))
