@@ -7,7 +7,7 @@ An AI-powered personal productivity planner.
 LifePilot uses AI to understand users' goals, work habits, and schedules, then generates personalized weekly and daily plans.
 
 ## Core Features
-
+degfghf
 - Structured AI consultation
 - Adaptive follow-up questions
 - Personalized productivity analysis
