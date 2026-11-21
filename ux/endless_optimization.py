@@ -28,6 +28,7 @@ from ux.optimization import (
     OptimizationEngine,
     build_mock_schedule,
     build_mock_suggestions,
+    entry_fields,
 )
 
 _SESSION_KEY = "lifeplot_opt_engine"
@@ -38,9 +39,10 @@ _PREVIEW_KEY = "lifeplot_show_preview"
 def render(schedule: list | None = None) -> None:
     """Render the optimization interaction.
 
-    ``schedule`` may be a list of :class:`~ux.optimization.ScheduleEntry` (or
-    any objects with ``title``/``start``/``end``). When omitted, a mock
-    schedule is used so the component is independently runnable.
+    ``schedule`` may be a list of B's schedule dictionaries (each with
+    ``title`` / ``start`` / ``end`` keys) or any objects with those
+    attributes. When omitted, a dict-shaped mock schedule is used so the
+    component is independently runnable.
     """
     schedule = list(schedule) if schedule else build_mock_schedule()
     engine = _get_engine()
@@ -83,9 +85,7 @@ def _render_schedule(schedule: list, engine: OptimizationEngine) -> None:
     applied = engine.applied_changes
     rows = []
     for entry in schedule:
-        title = getattr(entry, "title", "?")
-        start = getattr(entry, "start", "")
-        end = getattr(entry, "end", "")
+        title, start, end = entry_fields(entry)
         modified = any(title in change for change in applied)
         rows.append(
             {

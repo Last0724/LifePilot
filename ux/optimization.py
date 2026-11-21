@@ -32,11 +32,37 @@ CATEGORY_LABELS = {
 
 @dataclass(frozen=True)
 class ScheduleEntry:
-    """One mock entry in a generated schedule (title + HH:MM window)."""
+    """One object-shaped schedule entry (title + HH:MM window).
+
+    Kept as the object-shaped fixture for :func:`entry_fields`, which must
+    accept both this dataclass and B's real dictionary contract.
+    """
 
     title: str
     start: str
     end: str
+
+
+def entry_fields(item) -> tuple[str, str, str]:
+    """Return ``(title, start, end)`` from a dict- or object-shaped entry.
+
+    B's real schedule contract is a ``dict`` with ``title`` / ``start`` /
+    ``end`` keys (plus ``id`` / ``date`` / ``category`` / ``completed`` /
+    ``is_fixed``). Python's :func:`getattr` cannot read dictionary keys, so
+    the dict branch must use ``item.get(...)``. The object branch keeps
+    supporting :class:`ScheduleEntry` and future dataclass-based schedules.
+    """
+    if isinstance(item, dict):
+        return (
+            item.get("title", "?"),
+            item.get("start", ""),
+            item.get("end", ""),
+        )
+    return (
+        getattr(item, "title", "?"),
+        getattr(item, "start", ""),
+        getattr(item, "end", ""),
+    )
 
 
 @dataclass(frozen=True)
@@ -55,14 +81,65 @@ class Suggestion:
     simulated: bool = True
 
 
-def build_mock_schedule() -> list[ScheduleEntry]:
-    """Return a small deterministic schedule for the standalone preview."""
+def build_mock_schedule() -> list[dict]:
+    """Return a small deterministic schedule using B's real dictionary contract.
+
+    Each item carries the exact keys produced by B's frontend schedule
+    (``id`` / ``title`` / ``date`` / ``start`` / ``end`` / ``category`` /
+    ``completed`` / ``is_fixed``) so the standalone preview exercises the same
+    data shape the integrated Dashboard will pass in.
+    """
     return [
-        ScheduleEntry("Study calculus", "09:00", "10:30"),
-        ScheduleEntry("Read papers", "14:00", "15:00"),
-        ScheduleEntry("Write report", "15:00", "16:30"),
-        ScheduleEntry("Review flashcards", "16:30", "17:00"),
-        ScheduleEntry("Gym", "17:30", "18:30"),
+        {
+            "id": "mock_1",
+            "title": "Study calculus",
+            "date": "2026-11-23",
+            "start": "09:00",
+            "end": "10:30",
+            "category": "Study",
+            "completed": False,
+            "is_fixed": False,
+        },
+        {
+            "id": "mock_2",
+            "title": "Read papers",
+            "date": "2026-11-23",
+            "start": "14:00",
+            "end": "15:00",
+            "category": "Study",
+            "completed": False,
+            "is_fixed": False,
+        },
+        {
+            "id": "mock_3",
+            "title": "Write report",
+            "date": "2026-11-23",
+            "start": "15:00",
+            "end": "16:30",
+            "category": "Work",
+            "completed": False,
+            "is_fixed": False,
+        },
+        {
+            "id": "mock_4",
+            "title": "Review flashcards",
+            "date": "2026-11-23",
+            "start": "16:30",
+            "end": "17:00",
+            "category": "Study",
+            "completed": False,
+            "is_fixed": False,
+        },
+        {
+            "id": "mock_5",
+            "title": "Gym",
+            "date": "2026-11-23",
+            "start": "17:30",
+            "end": "18:30",
+            "category": "Personal",
+            "completed": False,
+            "is_fixed": True,
+        },
     ]
 
 

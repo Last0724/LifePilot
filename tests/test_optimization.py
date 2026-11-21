@@ -6,10 +6,27 @@ import unittest
 
 from ux.optimization import (
     OptimizationEngine,
+    ScheduleEntry,
     Suggestion,
     build_mock_schedule,
     build_mock_suggestions,
+    entry_fields,
 )
+
+# A faithful sample of B's real schedule contract (see ui/dashboard.py and
+# ui/planner.py): the entries are plain dictionaries, not objects, so getattr()
+# cannot read them. These fixtures exercise the exact shape the Dashboard will
+# pass into the Reverse-UX module.
+B_SCHEDULE_DICT = {
+    "id": "demo_0",
+    "title": "Outline research proposal",
+    "date": "2026-11-23",
+    "start": "09:00",
+    "end": "10:30",
+    "category": "Study",
+    "completed": False,
+    "is_fixed": False,
+}
 
 
 class MockSuggestionsTests(unittest.TestCase):
@@ -101,6 +118,48 @@ class OptimizationEngineTests(unittest.TestCase):
         self.assertIsNone(engine.current)
         self.assertIsNone(engine.apply())
         self.assertEqual(engine.preview(), "")
+
+
+class ScheduleCompatibilityTests(unittest.TestCase):
+    """Feature 01 must read B's real dictionary schedule, not just objects."""
+
+    def test_entry_fields_reads_real_dict(self):
+        self.assertEqual(
+            entry_fields(B_SCHEDULE_DICT),
+            ("Outline research proposal", "09:00", "10:30"),
+        )
+
+    def test_entry_fields_reads_object_shape(self):
+        entry = ScheduleEntry("Study calculus", "09:00", "10:30")
+        self.assertEqual(entry_fields(entry), ("Study calculus", "09:00", "10:30"))
+
+    def test_entry_fields_dict_missing_keys_fall_back(self):
+        self.assertEqual(entry_fields({}), ("?", "", ""))
+        self.assertEqual(entry_fields({"title": "Only a title"}), ("Only a title", "", ""))
+
+    def test_entry_fields_ignores_extra_contract_keys(self):
+        # id/date/category/completed/is_fixed must not interfere with the
+        # three display fields.
+        self.assertEqual(entry_fields(B_SCHEDULE_DICT)[0], "Outline research proposal")
+
+    def test_mock_schedule_uses_dict_contract(self):
+        for item in build_mock_schedule():
+            self.assertIsInstance(item, dict)
+            self.assertEqual(
+                set(item),
+                {"id", "title", "date", "start", "end", "category", "completed", "is_fixed"},
+            )
+
+    def test_mock_schedule_reads_correctly_via_entry_fields(self):
+        for item in build_mock_schedule():
+            title, start, end = entry_fields(item)
+            self.assertNotEqual(title, "?")
+            self.assertTrue(start and end)
+
+    def test_full_contract_list_passes_through(self):
+        schedule = [B_SCHEDULE_DICT, build_mock_schedule()[0]]
+        titles = [entry_fields(item)[0] for item in schedule]
+        self.assertEqual(titles, ["Outline research proposal", "Study calculus"])
 
 
 if __name__ == "__main__":
