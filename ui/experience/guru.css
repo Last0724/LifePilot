@@ -1,6 +1,28 @@
 .lp-guru { max-width:1160px; }
 .lp-guru > .lp-page-heading > .lp-inline-actions { justify-content:flex-end; flex-shrink:0; }
 .lp-guru-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px; }
+.lp-marketplace, .lp-guru-routines { display:grid; gap:12px; }
+.lp-guru-routines { margin-top:26px; }
+.lp-marketplace-heading, .lp-marketplace-labels { display:flex; align-items:center; flex-wrap:wrap; gap:7px; }
+.lp-marketplace-heading { justify-content:space-between; }
+.lp-marketplace-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; }
+.lp-marketplace-card { display:grid; grid-template-rows:auto auto 1fr auto; gap:9px; padding:16px; min-width:0; }
+.lp-marketplace-card h3, .lp-marketplace-preview h3 { margin:0; padding:0; color:var(--ink); font-size:16px; font-weight:730; letter-spacing:-.02em; }
+.lp-marketplace-card p { color:var(--muted); font-size:14px; }
+.lp-marketplace-card .lp-button { justify-self:start; }
+.lp-marketplace-badge {
+  display:inline-flex; align-items:center; padding:3px 8px; border-radius:6px;
+  background:#ececec; color:#383838; font-size:12px; font-weight:700;
+}
+.lp-marketplace-locked { background:#e2e2e2; color:#272727; }
+.lp-marketplace-plan { padding:5px 9px; }
+.lp-marketplace-preview { display:grid; gap:11px; }
+.lp-marketplace-preview ul { margin:0; padding-inline-start:19px; color:#454545; font-size:14px; }
+.lp-marketplace-preview .lp-marketplace-blocks { list-style:none; padding:0; }
+.lp-marketplace-blocks li { padding:6px 0; border-bottom:1px solid var(--line); }
+.lp-marketplace-preview .lp-marketplace-offer { display:grid; gap:3px; padding:10px 12px; border-radius:8px; background:#efefef; font-size:13px; }
+.lp-marketplace-offer span { color:#4f4f4f; }
+.lp-marketplace-preview .lp-actions { margin-top:0; }
 .lp-guru-card { min-width:0; display:grid; grid-template-rows:auto 1fr; overflow:hidden; }
 .lp-guru-card-top { padding:17px 16px 13px; display:grid; gap:6px; background:#ededed; }
 .lp-guru-card-top h2 { font-size:clamp(17px,1.7vw,23px); }
@@ -64,7 +86,7 @@
   .lp-guru-detail { grid-template-columns:1fr; }
 }
 @media (max-width:610px) {
-  .lp-guru-grid { grid-template-columns:1fr; }
+  .lp-guru-grid, .lp-marketplace-grid { grid-template-columns:1fr; }
   .lp-guru-heading { align-items:flex-start; }
   .lp-guru > .lp-page-heading:has(> .lp-inline-actions) { flex-wrap:wrap; }
 }

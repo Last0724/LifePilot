@@ -17,15 +17,49 @@
         <a href="${portraitSource}" target="_blank" rel="noopener noreferrer">${t("The Royal Society photo", "英国皇家学会照片")}</a> · <a href="${license}" target="_blank" rel="noopener noreferrer">CC BY-SA 3.0</a>
       </figcaption></figure>`;
 
+    function marketplace() {
+      const current = state();
+      const premium = G.marketplaceState(current).tier === "premium";
+      return `<section class="lp-marketplace" aria-labelledby="lp-marketplace-title">
+        <div class="lp-marketplace-heading">
+          <h2 id="lp-marketplace-title">${t("Template Marketplace", "模板市场")}</h2>
+          <div class="lp-inline-actions">
+            <span class="lp-marketplace-badge lp-marketplace-plan" role="status">${premium
+              ? t("Marketplace Premium · Demo", "市场 Premium · 模拟")
+              : t("Marketplace Free", "市场免费版")}</span>
+            ${premium ? button(t("Return to Free plan", "降回免费版"), "marketplace-downgrade", "lp-subtle") : ""}
+          </div>
+        </div>
+        <div class="lp-marketplace-grid">
+          ${G.marketplaceCatalog(current).map((template) => `
+            <article class="lp-card lp-marketplace-card" aria-labelledby="lp-market-${template.id}">
+              <div class="lp-marketplace-labels">
+                <span class="lp-marketplace-badge ${template.locked ? "lp-marketplace-locked" : ""}">${template.tier === "free"
+                  ? t("Free", "免费")
+                  : template.locked ? t("Premium · Locked", "Premium · 已锁定") : t("Premium · Unlocked", "Premium · 已解锁")}</span>
+                ${template.selected ? `<span class="lp-marketplace-badge">${t("Selected", "已选择")}</span>` : ""}
+              </div>
+              <h3 id="lp-market-${template.id}">${e(tt(template.title))}</h3>
+              <p>${e(tt(template.description))}</p>
+              ${button(template.locked ? t("Preview locked template", "预览锁定模板") : t("Preview template", "预览模板"),
+                "marketplace-preview", "lp-outline", `data-market-template="${template.id}" aria-haspopup="dialog"`)}
+            </article>`).join("")}
+        </div>
+      </section>`;
+    }
+
     function gallery() {
       return `<section class="lp-feature lp-guru">
         <div class="lp-page-heading"><div><h1>${t("Guru Templates", "大师模板")}</h1>
-          <p class="lp-page-description">${t("Three simulated productivity programs, each with a different catch.", "三套模拟效率课程，各有各的套路。")}</p></div>
+          <p class="lp-page-description">${t("Preview weekly templates or try an interactive routine.", "预览每周模板，或试跑互动课程。")}</p></div>
           <div class="lp-inline-actions">
             ${button(t("Back to Weekly Calendar", "返回周历"), "navigate", "lp-subtle", 'data-route="calendar"')}
             ${button(t("Preview course ad", "预览课程广告"), "guru-preview-ad", "lp-outline")}
           </div></div>
-        <div class="lp-guru-grid">${Object.values(G.TEMPLATES).map((template) =>
+        ${marketplace()}
+        <section class="lp-guru-routines" aria-labelledby="lp-guru-routines-title">
+          <h2 id="lp-guru-routines-title">${t("Interactive routines", "互动课程")}</h2>
+          <div class="lp-guru-grid">${Object.values(G.TEMPLATES).map((template) =>
           `<article class="lp-card lp-guru-card lp-guru-${template.id}">
             <div class="lp-guru-card-top"><p class="lp-guru-name">${tt(template.guru)}</p>
               <h2>${tt(template.title)}</h2><p class="lp-guru-price">${tt(template.price)}</p>
@@ -35,7 +69,9 @@
               <p>${tt(template.pitch)}</p>
               ${select(t("View routine", "查看作息"), template.id, "lp-outline")}
             </div>
-          </article>`).join("")}</div></section>`;
+          </article>`).join("")}</div>
+        </section>
+      </section>`;
     }
 
     function timeline(template, run) {
@@ -120,11 +156,11 @@
             <p class="lp-guru-price">${tt(template.price)}</p>
             <div class="lp-inline-actions">
               ${locked
-                ? action(t("Simulate Premium subscription", "模拟订阅 Premium"), "ask-unlock", "lp-primary")
+                ? action(t("Simulate HYPER unlock", "模拟解锁 HYPER"), "ask-unlock", "lp-primary")
                 : action(started ? t("Restart routine", "重启作息") : t("Start routine", "启动作息"), "start", started ? "lp-subtle" : "lp-primary")}
               ${id === "slack" && !run?.unlocked ? action(t("Unlock advanced tips (demo)", "模拟付费解锁高级技巧"), "ask-unlock") : ""}
             </div>
-            ${run?.unlocked ? `<p class="lp-muted">${id === "hyper" ? t("Demo Premium unlocked.", "演示 Premium 已解锁。") : t("Advanced tip: rename procrastination ‘preparation’.", "高级技巧：把拖延改名为「准备工作」。")}</p>` : ""}
+            ${run?.unlocked ? `<p class="lp-muted">${id === "hyper" ? t("HYPER unlocked for this demo.", "HYPER 已在演示中解锁。") : t("Advanced tip: rename procrastination ‘preparation’.", "高级技巧：把拖延改名为「准备工作」。")}</p>` : ""}
             ${runDetails(template, run)}
           </section>
           ${run?.alerts?.length ? `<section class="lp-card lp-guru-alerts" aria-label="${t("Routine feedback", "作息反馈")}"><h2>${t("Routine feedback", "作息反馈")}</h2>

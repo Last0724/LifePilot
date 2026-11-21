@@ -253,6 +253,34 @@ function mountLifePilot(root) {
     if (result.course) showCoursePromotion(result.course);
   }
 
+  function showMarketplacePreview(id, state = data) {
+    const template = G.marketplaceCatalog(state).find((item) => item.id === id);
+    if (!template) return;
+
+    const items = (entries) => entries.map((entry) => `<li>${V.e(t(...entry))}</li>`).join("");
+    const details = `data-market-template="${V.e(id)}"`;
+    const action = template.locked
+      ? V.button(t("Simulate Marketplace upgrade", "模拟升级市场会员"), "marketplace-upgrade", "lp-primary", details)
+      : V.button(template.selected ? t("Selected", "已选择") : t("Select template", "选择模板"),
+        "marketplace-select", "lp-primary", template.selected ? `${details} disabled` : details);
+
+    showDialog(t(...template.title), `<section class="lp-marketplace-preview" data-market-preview="${V.e(id)}">
+      <p class="lp-muted">${template.locked ? t("Locked preview · 2 of 4 blocks", "锁定预览 · 4 段中的 2 段")
+        : t("Routine preview · 4 blocks", "完整预览 · 4 段")}</p>
+      <ul class="lp-marketplace-blocks">${items(template.preview)}</ul>
+      <h3>${t("Template benefits", "模板内容")}</h3>
+      <ul>${items(template.benefits)}</ul>
+      ${template.locked ? `<p class="lp-marketplace-offer">
+        <strong>${t("Marketplace Premium", "市场 Premium")} · ${t(...G.MARKETPLACE_PRICE)}</strong>
+        <span>${t("No payment. Interactive routines have separate unlocks.", "演示升级不收费，互动课程需单独解锁。")}</span>
+      </p>` : ""}
+      <div class="lp-actions">
+        ${V.button(template.locked ? t("Not now", "暂不升级") : t("Back to templates", "返回模板"), "close-dialog", "lp-subtle", "autofocus")}
+        ${action}
+      </div>
+    </section>`);
+  }
+
   function openGuruTemplate(id) {
     if (!Object.hasOwn(G.TEMPLATES, id)) return;
     if (dialogue.open) dialogue.close();
@@ -336,7 +364,7 @@ function mountLifePilot(root) {
     if (!guruSelection) return;
     if (action === "ask-unlock") {
       const premium = guruSelection === "hyper";
-      confirm(premium ? t("Activate demo Premium?", "启用演示 Premium？") : t("Unlock demo tips?", "解锁演示技巧？"),
+      confirm(premium ? t("Unlock HYPER Premium (demo)?", "模拟解锁 HYPER Premium？") : t("Unlock demo tips?", "解锁演示技巧？"),
         premium
           ? t("The listed ¥199/month price is fictional. This button unlocks the routine inside the demo.", "¥199／月是演示定价。按钮只解锁这里的模板。")
           : t("This button simulates a paid unlock inside LifePilot.", "该按钮在 LifePilot 站内模拟付费解锁。"),
@@ -530,6 +558,22 @@ function mountLifePilot(root) {
       case "guru-preview-ad":
         showNextCoursePromotion();
         break;
+      case "marketplace-preview":
+        showMarketplacePreview(values.marketTemplate);
+        break;
+      case "marketplace-upgrade":
+        change((state) => G.setMarketplaceTier(state, "premium"));
+        showMarketplacePreview(values.marketTemplate);
+        break;
+      case "marketplace-downgrade":
+        change((state) => G.setMarketplaceTier(state, "free"));
+        break;
+      case "marketplace-select": {
+        const result = change((state) => G.selectMarketplaceTemplate(state, values.marketTemplate));
+        if (result.locked) showMarketplacePreview(values.marketTemplate, read() || data);
+        else dialogue.close();
+        break;
+      }
       case "guru-gallery":
         stopGuruVoice();
         clearToasts();
@@ -651,6 +695,10 @@ function mountLifePilot(root) {
     } else {
       if (fresh.preferences.paused) clearToasts();
       render();
+      if (dialogue.open) {
+        const preview = dialogue.querySelector("[data-market-preview]");
+        if (preview) showMarketplacePreview(preview.dataset.marketPreview);
+      }
     }
   }, { signal });
 

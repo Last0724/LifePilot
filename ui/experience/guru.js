@@ -45,7 +45,7 @@
       id: "hyper",
       guru: ["The 10M-Follower Efficiency Influencer", "千万粉效率大V"],
       title: ["HYPER · The Ultimate Fragmented Parallel Method", "HYPER 碎片化并行终极法"],
-      price: ["¥199 / month · Premium", "¥199 / 月 · Premium"],
+      price: ["¥199 / month · HYPER Premium", "¥199 / 月 · HYPER Premium"],
       pitch: ["Switch tasks every 15 minutes. At bedtime, even rest gets its own guru soundtrack.", "每 15 分钟切换一次任务。睡觉也得听大师安排。"],
       blocks: hyperBlocks,
     },
@@ -89,6 +89,128 @@
       "用一小时的工作填满八小时。进阶摸鱼技巧可付费解锁。",
     ],
   };
+
+  const MARKETPLACE_PRICE = ["$12 / month · simulated", "$12 / 月 · 模拟"];
+  const MARKETPLACE_TEMPLATES = [
+    {
+      id: "deep-work-master-plan",
+      title: ["Deep Work Master Plan", "深度工作计划"],
+      tier: "free",
+      description: [
+        "Protect two long focus blocks each day and let shallow work fill the gaps.",
+        "每天留出两个长时专注时段，把杂务安排在间隙。",
+      ],
+      benefits: [
+        ["Two protected focus blocks per workday", "每个工作日保留两个专注时段"],
+        ["Shallow-work window after lunch", "午饭后的杂务时段"],
+        ["Weekly review checklist", "每周复盘清单"],
+      ],
+      preview: [
+        ["Mon · 09:00–11:00 · Deep work sprint", "周一 · 09:00–11:00 · 深度工作冲刺"],
+        ["Mon · 14:00–15:00 · Shallow work batch", "周一 · 14:00–15:00 · 集中处理杂务"],
+        ["Tue · 09:00–11:00 · Deep work sprint", "周二 · 09:00–11:00 · 深度工作冲刺"],
+        ["Wed · 09:00–10:30 · Deep work sprint", "周三 · 09:00–10:30 · 深度工作冲刺"],
+      ],
+    },
+    {
+      id: "exam-preparation-system",
+      title: ["Exam Preparation System", "考试备考系统"],
+      tier: "premium",
+      description: [
+        "Turn a syllabus into spaced revision sessions with protected practice time.",
+        "按考试大纲安排间隔复习，并为练习留出固定时间。",
+      ],
+      benefits: [
+        ["Spaced repetition across every subject", "覆盖各科的间隔复习"],
+        ["Practice-test blocks with review buffers", "模拟测试和讲评预留时间"],
+        ["Daily minimum revision target", "每日最低复习目标"],
+        ["Exam-week fallback plan", "考试周备用计划"],
+      ],
+      preview: [
+        ["Mon · 18:00–19:30 · Calculus practice set", "周一 · 18:00–19:30 · 微积分练习"],
+        ["Tue · 07:30–08:15 · Flashcards review", "周二 · 07:30–08:15 · 复习记忆卡片"],
+        ["Wed · 18:00–19:30 · Mock paper", "周三 · 18:00–19:30 · 模拟试卷"],
+        ["Thu · 07:30–08:15 · Error log review", "周四 · 07:30–08:15 · 复盘错题"],
+      ],
+    },
+    {
+      id: "ultimate-productivity-routine",
+      title: ["Ultimate Productivity Routine", "终极效率作息"],
+      tier: "premium",
+      description: [
+        "A high-intensity weekly routine that balances deep work, admin and recovery.",
+        "在高强度的一周里安排深度工作、日常事务和休息。",
+      ],
+      benefits: [
+        ["Adaptive priority triage", "动态调整优先级"],
+        ["Recovery and buffer blocks", "恢复与缓冲时段"],
+        ["Deadline risk radar", "截止日期风险检查"],
+        ["Friday shutdown ritual", "周五收尾流程"],
+      ],
+      preview: [
+        ["Mon · 08:30–10:30 · Priority deep work", "周一 · 08:30–10:30 · 优先处理深度工作"],
+        ["Mon · 16:00–16:45 · Admin sweep", "周一 · 16:00–16:45 · 清理日常事务"],
+        ["Tue · 08:30–10:30 · Priority deep work", "周二 · 08:30–10:30 · 优先处理深度工作"],
+        ["Fri · 16:00–16:45 · Weekly shutdown", "周五 · 16:00–16:45 · 一周收尾"],
+      ],
+    },
+    {
+      id: "elite-weekly-planner",
+      title: ["Elite Weekly Planner", "精英周计划"],
+      tier: "free",
+      description: [
+        "Start every week with a realistic capacity check and a clear top-three list.",
+        "每周先评估可用时间，再明确三项最重要的目标。",
+      ],
+      benefits: [
+        ["Top-three weekly outcomes", "本周三项重点成果"],
+        ["Capacity check before committing", "接下任务前检查可用时间"],
+        ["Sunday planning ritual", "周日规划流程"],
+      ],
+      preview: [
+        ["Sun · 19:00–19:30 · Weekly reset", "周日 · 19:00–19:30 · 整理下周计划"],
+        ["Mon · 08:45–09:00 · Top-three review", "周一 · 08:45–09:00 · 确认三项重点"],
+        ["Wed · 17:00–17:15 · Midweek check-in", "周三 · 17:00–17:15 · 检查本周进度"],
+        ["Fri · 16:30–16:45 · Close the week", "周五 · 16:30–16:45 · 本周总结"],
+      ],
+    },
+  ];
+
+  function marketplaceState(state) {
+    const saved = state.guruMarketplace;
+    return {
+      tier: saved?.tier === "premium" ? "premium" : "free",
+      selectedTemplateId: saved?.selectedTemplateId ?? null,
+    };
+  }
+
+  function marketplaceCatalog(state) {
+    const membership = marketplaceState(state);
+    return MARKETPLACE_TEMPLATES.map((template) => {
+      const locked = template.tier === "premium" && membership.tier === "free";
+      return {
+        ...template,
+        locked,
+        selected: !locked && membership.selectedTemplateId === template.id,
+        preview: locked ? template.preview.slice(0, 2) : template.preview,
+      };
+    });
+  }
+
+  function setMarketplaceTier(state, tier) {
+    const membership = marketplaceState(state);
+    if ((tier !== "free" && tier !== "premium") || tier === membership.tier) return {};
+    state.guruMarketplace = { ...membership, tier };
+    return { updated: true };
+  }
+
+  function selectMarketplaceTemplate(state, id) {
+    const template = marketplaceCatalog(state).find((item) => item.id === id);
+    if (!template || template.selected) return {};
+    if (template.locked) return { locked: true };
+    state.guruMarketplace = { ...marketplaceState(state), selectedTemplateId: id };
+    return { updated: true };
+  }
 
   function takeCoursePromotion(state, day = null) {
     const previous = state.coursePromotions;
@@ -187,5 +309,8 @@
     return { updated: true, guruAlerts: alerts, guruVoice, guruStopVoice };
   }
 
-  return { TEMPLATES, SLACK_TASKS, SLEEP_VOICE, COURSE_PROMOTIONS, takeCoursePromotion, clock, update };
+  return {
+    TEMPLATES, SLACK_TASKS, SLEEP_VOICE, COURSE_PROMOTIONS, takeCoursePromotion, clock, update,
+    MARKETPLACE_PRICE, marketplaceState, marketplaceCatalog, setMarketplaceTier, selectMarketplaceTemplate,
+  };
 });
