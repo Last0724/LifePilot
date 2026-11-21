@@ -152,8 +152,9 @@ Confirmed questionnaire (JSON). The user has already accepted or corrected
 every entry here, so treat it as fact:
 {questionnaire}
 
-Follow-up answers (JSON; keys match the question ids, empty when no question
-was asked):
+Follow-up answers (JSON). Keys are the questionnaire field names each answer
+belongs to, and values are the user's verbatim answers; it is empty when no
+question was asked:
 {follow_up_answers}
 
 Reply with exactly this JSON shape:
@@ -170,6 +171,8 @@ Reply with exactly this JSON shape:
 Rules:
 - Use only the confirmed questionnaire and the answers above. Do not
   reintroduce activities that were suggested earlier but not confirmed.
+- The follow-up answers are already grouped by field; read the field name
+  from the JSON key, never guess a field from the wording of an answer.
 - recommended_work_block_minutes must be an integer between
   {min_block} and {max_block}.
 - break_preferences is a single short string, not a list.
@@ -179,6 +182,43 @@ Rules:
   questionnaire, and the model must not restate or alter them.
 - Return raw JSON. No markdown fences, no commentary.
 """
+
+
+EXTRACT_PROMPT = """Extract structured scheduling data from a user's answer.
+
+The answer belongs to the questionnaire field "{field}".
+
+Raw answer:
+{raw_answer}
+
+Return exactly one JSON object shaped for this field:
+
+- "preferred_work_start" or "preferred_work_end":
+  {{"time": "HH:MM"}}
+- "work_days":
+  {{"weekdays": [0,1,2,3,4,5,6]}}  (0 = Monday, 6 = Sunday)
+- "energy_peak":
+  {{"energy_peak": "morning"}}  (one of morning / afternoon / evening / flexible)
+- "rest_periods":
+  {{"rest_periods": [{{"title": "...", "days": [0..6],
+    "start_time": "HH:MM", "end_time": "HH:MM"}}]}}
+- "predictable_routines":
+  {{"predictable_routines": [{{"title": "...", "weekdays": [0..6],
+    "estimated_minutes": N, "preferred_start": "HH:MM",
+    "preferred_end": "HH:MM"}}]}}
+
+Rules:
+- Use only information present in the raw answer. Never invent a time, day or
+  duration that the user did not state.
+- If the answer does not contain enough information to fill the required
+  fields, return {{}}.
+- Return raw JSON. No markdown fences, no commentary.
+"""
+
+
+def render_extract_prompt(field: str, raw_answer: str) -> str:
+    """Fill the structured-extraction prompt for one field and one answer."""
+    return EXTRACT_PROMPT.format(field=field, raw_answer=raw_answer)
 
 
 def render_classify_prompt(questionnaire: str) -> str:

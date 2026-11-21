@@ -27,7 +27,12 @@ from enum import Enum
 
 from core import ai_consultant
 from core.ai_client import AINetworkError
-from core.models import ConsultationDraft, FollowUpQuestion, UserProfile
+from core.models import (
+    ConsultationDraft,
+    FollowUpQuestion,
+    QuestionnaireData,
+    UserProfile,
+)
 
 
 class FakeClient:
@@ -641,6 +646,263 @@ class HelperTests(unittest.TestCase):
             {"question": "No target"},
         ]
         self.assertEqual(ai_consultant._extract_question_texts(raw), {"goals": "First?"})
+
+
+# ---------------------------------------------------------------------------
+# Answer mapping (V1.2)
+# ---------------------------------------------------------------------------
+
+
+class AnswerMappingTests(unittest.TestCase):
+    def test_maps_question_ids_to_fields(self):
+        result = ai_consultant.map_answers_to_fields(
+            {"q1": "rest_periods", "q2": "work_days"},
+            {"q1": "Sleep 23:00-07:00", "q2": "Mon Wed Fri"},
+        )
+        self.assertEqual(
+            result,
+            {"rest_periods": ["Sleep 23:00-07:00"], "work_days": ["Mon Wed Fri"]},
+        )
+
+    def test_question_id_without_target_is_dropped(self):
+        result = ai_consultant.map_answers_to_fields(
+            {"q1": "rest_periods"},
+            {"q1": "Sleep", "q2": "orphan answer"},
+        )
+        self.assertEqual(result, {"rest_periods": ["Sleep"]})
+
+    def test_target_without_field_name_is_dropped(self):
+        result = ai_consultant.map_answers_to_fields(
+            {"q1": ""}, {"q1": "Sleep"}
+        )
+        self.assertEqual(result, {})
+
+    def test_empty_targets_returns_empty(self):
+        result = ai_consultant.map_answers_to_fields({}, {"q1": "Sleep"})
+        self.assertEqual(result, {})
+
+    def test_unknown_question_ids_are_ignored(self):
+        result = ai_consultant.map_answers_to_fields(
+            {"q1": "goals"},
+            {"q1": "Pass", "q9x": "junk"},
+        )
+        self.assertEqual(result, {"goals": ["Pass"]})
+
+
+# ---------------------------------------------------------------------------
+# Field state vs defaults (V1.2)
+# ---------------------------------------------------------------------------
+
+
+class FieldStateDefaultTests(unittest.TestCase):
+    def test_defaulted_fields_are_unresolved(self):
+        questionnaire = QuestionnaireData(goals=["Pass calculus"])
+        controller = ai_consultant.ConsultationController(questionnaire, client=FakeClient())
+        self.assertIn("preferred_work_start", controller.unresolved)
+        self.assertIn("preferred_work_end", controller.unresolved)
+        self.assertIn("work_days", controller.unresolved)
+
+    def test_confirmed_fields_resolve_defaulted_fields(self):
+        questionnaire = QuestionnaireData(goals=["Pass calculus"])
+        controller = ai_consultant.ConsultationController(
+            questionnaire,
+            client=FakeClient(),
+            confirmed_fields={"goals", "preferred_work_start", "preferred_work_end", "work_days"},
+        )
+        self.assertIn("preferred_work_start", controller.resolved)
+        self.assertIn("work_days", controller.resolved)
+
+    def test_confirmed_but_empty_stays_unresolved(self):
+        controller = ai_consultant.ConsultationController(
+            {"goals": ["x"], "preferred_work_start": ""},
+            client=FakeClient(),
+            confirmed_fields={"preferred_work_start"},
+        )
+        self.assertIn("preferred_work_start", controller.unresolved)
+
+    def test_legacy_dict_filled_fields_still_resolve(self):
+        controller = ai_consultant.ConsultationController(FULL_QUESTIONNAIRE, client=FakeClient())
+        self.assertTrue(controller.is_complete)
+
+    def test_non_default_start_resolves_even_without_confirmation(self):
+        questionnaire = QuestionnaireData(goals=["x"], preferred_work_start="07:00")
+        controller = ai_consultant.ConsultationController(questionnaire, client=FakeClient())
+        self.assertIn("preferred_work_start", controller.resolved)
+
+
+# ---------------------------------------------------------------------------
+# Fallback preserves confirmed answers (V1.2)
+# ---------------------------------------------------------------------------
+
+
+class FallbackPreserveAnswersTests(unittest.TestCase):
+    def test_fallback_preserves_follow_up_answers(self):
+        client = FakeClient(error=AINetworkError("down"))
+        profile = ai_consultant.finalize_profile(
+            {"goals": ["x"]},
+            {"q1": "Sleep 23:00-07:00", "q2": "morning"},
+            client=client,
+            question_targets={"q1": "rest_periods", "q2": "energy_peak"},
+        )
+        self.assertTrue(profile["is_fallback"])
+        self.assertIn("Sleep", profile["scheduling_notes"])
+
+    def test_fallback_merges_goal_answers_into_goals(self):
+        client = FakeClient(error=AINetworkError("down"))
+        profile = ai_consultant.finalize_profile(
+            {"goals": ["Finish thesis"]},
+            {"q1": "Pass calculus"},
+            client=client,
+            question_targets={"q1": "goals"},
+        )
+        self.assertIn("Pass calculus", profile["goals"])
+
+    def test_legacy_build_fallback_without_answers_still_works(self):
+        profile = ai_consultant.build_fallback_profile(QUESTIONNAIRE)
+        self.assertTrue(profile["is_fallback"])
+        self.assertEqual(profile["goals"], ["Finish the thesis"])
+
+    def test_fallback_marks_answers_not_ai_generated(self):
+        profile = ai_consultant.build_fallback_profile(
+            {"goals": ["x"]},
+            {"q1": "Sleep 23:00-07:00"},
+            question_targets={"q1": "rest_periods"},
+        )
+        self.assertIn("not AI-generated", profile["scheduling_notes"])
+
+
+# ---------------------------------------------------------------------------
+# Structured integration (V1.2)
+# ---------------------------------------------------------------------------
+
+
+class StructuredIntegrationTests(unittest.TestCase):
+    def _controller_with_answers(self, answers, targets, unknown=None, questionnaire=None):
+        controller = ai_consultant.ConsultationController(
+            questionnaire or {"goals": ["x"]}, client=FakeClient()
+        )
+        controller._question_targets = dict(targets)
+        controller._answers = dict(answers)
+        if unknown:
+            controller.unknown = list(unknown)
+        return controller
+
+    def test_parses_rest_period(self):
+        controller = self._controller_with_answers(
+            {"q1": "Sleep 23:00-07:00"}, {"q1": "rest_periods"}
+        )
+        result = controller.build_questionnaire_inputs(use_llm=False)
+        self.assertEqual(
+            result["fields"]["rest_periods"],
+            [{"title": "Sleep", "days": [0, 1, 2, 3, 4, 5, 6], "start_time": "23:00", "end_time": "07:00"}],
+        )
+
+    def test_parses_predictable_routine(self):
+        controller = self._controller_with_answers(
+            {"q1": "Morning run 30 minutes at 07:00"}, {"q1": "predictable_routines"}
+        )
+        result = controller.build_questionnaire_inputs(use_llm=False)
+        routine = result["fields"]["predictable_routines"][0]
+        self.assertEqual(routine["title"], "Morning run")
+        self.assertEqual(routine["estimated_minutes"], 30)
+
+    def test_parses_work_days(self):
+        controller = self._controller_with_answers(
+            {"q1": "Monday Wednesday Friday"}, {"q1": "work_days"}
+        )
+        result = controller.build_questionnaire_inputs(use_llm=False)
+        self.assertEqual(result["fields"]["work_days"], [0, 2, 4])
+
+    def test_parses_energy_peak(self):
+        controller = self._controller_with_answers(
+            {"q1": "I'm most productive in the morning"}, {"q1": "energy_peak"}
+        )
+        result = controller.build_questionnaire_inputs(use_llm=False)
+        self.assertEqual(result["fields"]["energy_peak"], "morning")
+
+    def test_parses_am_pm_time(self):
+        controller = self._controller_with_answers(
+            {"q1": "I start at 7am"}, {"q1": "preferred_work_start"}
+        )
+        result = controller.build_questionnaire_inputs(use_llm=False)
+        self.assertEqual(result["fields"]["preferred_work_start"], "07:00")
+
+    def test_unparseable_goes_to_needs_confirmation(self):
+        controller = self._controller_with_answers(
+            {"q1": "whenever I feel like it"}, {"q1": "preferred_work_start"}
+        )
+        result = controller.build_questionnaire_inputs(use_llm=False)
+        self.assertNotIn("preferred_work_start", result["fields"])
+        self.assertIn("preferred_work_start", result["needs_confirmation"])
+
+    def test_unknown_fields_are_excluded_entirely(self):
+        controller = self._controller_with_answers(
+            {"q1": "I don't know"}, {"q1": "energy_peak"}, unknown=["energy_peak"]
+        )
+        result = controller.build_questionnaire_inputs(use_llm=False)
+        self.assertNotIn("energy_peak", result["fields"])
+        self.assertNotIn("energy_peak", result["needs_confirmation"])
+
+    def test_parse_energy_peak_unknown_returns_none(self):
+        self.assertIsNone(ai_consultant._parse_energy_peak("unknown"))
+
+    def test_finalize_uses_field_map_in_prompt(self):
+        client = FakeClient(FULL_PROFILE_PAYLOAD)
+        ai_consultant.finalize_profile(
+            {"goals": ["x"]},
+            {"q1": "Sleep 23:00-07:00"},
+            client=client,
+            question_targets={"q1": "rest_periods"},
+        )
+        prompt = client.messages[0][-1]["content"]
+        self.assertIn("rest_periods", prompt)
+        self.assertNotIn('"q1"', prompt)
+
+    def test_controller_finalize_returns_typed_profile(self):
+        client = FakeClient(FULL_PROFILE_PAYLOAD)
+        controller = ai_consultant.ConsultationController({"goals": ["x"]}, client=client)
+        profile = controller.finalize()
+        self.assertIsInstance(profile, UserProfile)
+
+    def test_controller_finalize_api_failure_degrades(self):
+        client = FakeClient(error=AINetworkError("down"))
+        controller = ai_consultant.ConsultationController({"goals": ["x"]}, client=client)
+        profile = controller.finalize()
+        self.assertTrue(profile.is_fallback)
+
+
+# ---------------------------------------------------------------------------
+# Deterministic parsers (V1.2)
+# ---------------------------------------------------------------------------
+
+
+class ParserTests(unittest.TestCase):
+    def test_parse_time_24h(self):
+        self.assertEqual(ai_consultant._parse_time("Start at 09:00"), "09:00")
+
+    def test_parse_time_am_pm(self):
+        self.assertEqual(ai_consultant._parse_time("7 pm"), "19:00")
+        self.assertEqual(ai_consultant._parse_time("7am"), "07:00")
+
+    def test_parse_weekdays_english_and_chinese(self):
+        self.assertEqual(ai_consultant._parse_weekdays("Mon Wed Fri"), [0, 2, 4])
+        self.assertEqual(ai_consultant._parse_weekdays("周一 周三 周五"), [0, 2, 4])
+
+    def test_parse_weekdays_none(self):
+        self.assertIsNone(ai_consultant._parse_weekdays("no days here"))
+
+    def test_parse_minutes(self):
+        self.assertEqual(ai_consultant._parse_minutes("30 minutes"), 30)
+        self.assertEqual(ai_consultant._parse_minutes("1 hour"), 60)
+        self.assertEqual(ai_consultant._parse_minutes("半小时"), 30)
+
+    def test_parse_rest_period_defaults_days(self):
+        result = ai_consultant._parse_rest_period("Sleep 23:00-07:00")
+        self.assertEqual(result["title"], "Sleep")
+        self.assertEqual(result["days"], [0, 1, 2, 3, 4, 5, 6])
+
+    def test_parse_rest_period_rejects_same_time(self):
+        self.assertIsNone(ai_consultant._parse_rest_period("Break 09:00-09:00"))
 
 
 if __name__ == "__main__":
