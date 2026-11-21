@@ -2,8 +2,11 @@
 
 from datetime import date, time, timedelta
 from html import escape
+from uuid import uuid4
 
 import streamlit as st
+
+from ui.calendar_input import first_overlap
 
 
 def _tasks_on_day(schedule: list[dict], day: date) -> list[dict]:
@@ -104,3 +107,32 @@ def render_task_editor(schedule: list[dict], day: date, *, key: str = "editor") 
 
     updated = dict(task, title=title, start=start_text, end=end_text, completed=completed)
     return [updated if current["id"] == selected_id else current for current in schedule]
+
+
+
+@st.dialog("Add a task", width="small")
+def add_weekly_task(week_start: date, schedule_key: str) -> None:
+    days = [week_start + timedelta(days=offset) for offset in range(7)]
+    with st.form("weekly_add_task"):
+        day = st.selectbox("Day", days, format_func=lambda value: f"{value:%A, %d %b}")
+        title = st.text_input("Task name", max_chars=120).strip()
+        first, second = st.columns(2)
+        start = first.time_input("Start time", time(9), step=60)
+        end = second.time_input("End time", time(10), step=60)
+        submitted = st.form_submit_button("Save task", type="primary")
+    if not submitted:
+        return
+    if not title or start >= end:
+        st.error("Enter a task name and choose an end time after the start.")
+        return
+    schedule = st.session_state[schedule_key]
+    entry = {
+        "id": uuid4().hex, "date": day.isoformat(), "title": title, "category": "Task",
+        "start": start.strftime("%H:%M"), "end": end.strftime("%H:%M"),
+        "completed": False, "is_fixed": False,
+    }
+    if conflict := first_overlap(schedule, entry):
+        st.error(f'This time overlaps with {conflict["title"]}. Choose a different time.')
+        return
+    st.session_state[schedule_key] = schedule + [entry]
+    st.rerun()
