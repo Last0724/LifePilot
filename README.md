@@ -41,6 +41,8 @@ Never commit API keys or private credentials.
 
 This project uses DeepSeek API for AI-powered consultation and productivity analysis.
 
+sasdawd
+
 ## License
 
 Apache License 2.0
