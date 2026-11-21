@@ -19,6 +19,7 @@ from core.models import (
     FollowUpQuestion,
     ModelError,
     Priority,
+    PredictableRoutine,
     QuestionnaireData,
     RestPeriod,
     ScheduleResult,
@@ -86,6 +87,7 @@ class TaskInputTests(unittest.TestCase):
         self.assertIsNone(task.preferred_start)
         self.assertIsNone(task.preferred_end)
         self.assertIsNone(task.preferred_days)
+        self.assertIsNone(task.importance_rank)
 
     def test_title_is_stripped(self) -> None:
         self.assertEqual(TaskInput("  Read paper  ", 30).title, "Read paper")
@@ -174,6 +176,26 @@ class TaskInputTests(unittest.TestCase):
         with self.assertRaises(ModelError):
             TaskInput("x", 30, preferred_days=[7])
 
+    def test_importance_rank_defaults_to_legacy_priority(self) -> None:
+        self.assertEqual(TaskInput("x", 30).effective_importance_rank, 2)
+        self.assertEqual(
+            TaskInput("x", 30, priority=Priority.HIGH).effective_importance_rank, 1
+        )
+        self.assertEqual(
+            TaskInput("x", 30, priority=Priority.LOW).effective_importance_rank, 3
+        )
+
+    def test_explicit_importance_rank_wins(self) -> None:
+        task = TaskInput("x", 30, priority=Priority.LOW, importance_rank=1)
+        self.assertEqual(task.importance_rank, 1)
+        self.assertEqual(task.effective_importance_rank, 1)
+
+    def test_importance_rank_must_be_positive_integer(self) -> None:
+        TaskInput("x", 30, importance_rank=999)
+        for bad in (0, -1, 1000, 1.5, True, "1"):
+            with self.assertRaises(ModelError, msg=repr(bad)):
+                TaskInput("x", 30, importance_rank=bad)  # type: ignore[arg-type]
+
 
 class FixedCommitmentTests(unittest.TestCase):
     def test_valid_commitment(self) -> None:
@@ -229,21 +251,107 @@ class RestPeriodTests(unittest.TestCase):
             RestPeriod("Sleep", [0], "9:00", "07:00")
 
 
+class PredictableRoutineTests(unittest.TestCase):
+    def test_valid_routine_without_preference(self) -> None:
+        routine = PredictableRoutine("Morning run", [0, 2, 2], 30)
+        self.assertEqual(routine.title, "Morning run")
+        self.assertEqual(routine.weekdays, [0, 2])
+        self.assertEqual(routine.estimated_minutes, 30)
+        self.assertIsNone(routine.preferred_start)
+        self.assertIsNone(routine.preferred_end)
+
+    def test_preferred_start_only(self) -> None:
+        routine = PredictableRoutine(
+            "Read", [1], 45, preferred_start=" 07:30 "
+        )
+        self.assertEqual(routine.preferred_start, "07:30")
+        self.assertIsNone(routine.preferred_end)
+
+    def test_preferred_window(self) -> None:
+        routine = PredictableRoutine(
+            "Gym", [2], 60, preferred_start="18:00", preferred_end="20:00"
+        )
+        self.assertEqual(routine.preferred_start, "18:00")
+        self.assertEqual(routine.preferred_end, "20:00")
+
+    def test_title_is_required(self) -> None:
+        with self.assertRaises(ModelError):
+            PredictableRoutine("   ", [0], 30)
+
+    def test_weekdays_are_required_and_normalized(self) -> None:
+        self.assertEqual(PredictableRoutine("Run", [5, 1, 1], 30).weekdays, [1, 5])
+        for bad in ([], [7], [-1], [True], ["1"]):
+            with self.assertRaises(ModelError, msg=f"bad weekdays: {bad!r}"):
+                PredictableRoutine("Run", bad, 30)  # type: ignore[arg-type]
+
+    def test_estimated_minutes_bounds_and_type(self) -> None:
+        PredictableRoutine("Run", [0], 1)
+        PredictableRoutine("Run", [0], 480)
+        for bad in (0, 481, -5, 30.0, "30", True):
+            with self.assertRaises(ModelError, msg=f"bad duration: {bad!r}"):
+                PredictableRoutine("Run", [0], bad)  # type: ignore[arg-type]
+
+    def test_preferred_end_without_start_rejected(self) -> None:
+        with self.assertRaises(ModelError):
+            PredictableRoutine("Run", [0], 30, preferred_end="08:00")
+
+    def test_preferred_window_must_be_positive_and_same_day(self) -> None:
+        for start, end in (
+            ("08:00", "08:00"),
+            ("09:00", "08:00"),
+            ("23:00", "07:00"),
+            ("9:00", "10:00"),
+        ):
+            with self.assertRaises(ModelError, msg=f"{start} ~ {end}"):
+                PredictableRoutine(
+                    "Run", [0], 30, preferred_start=start, preferred_end=end
+                )
+
+
 class FollowUpQuestionTests(unittest.TestCase):
     def test_valid_question(self) -> None:
-        question = FollowUpQuestion("q1", "  How many hours?  ")
+        question = FollowUpQuestion("q1", "  How many hours?  ", " tasks ", 3)
         self.assertEqual(question.id, "q1")
         self.assertEqual(question.question, "How many hours?")
+        self.assertEqual(question.target_field, "tasks")
+        self.assertEqual(question.priority, 3)
 
-    def test_id_must_be_q1_or_q2(self) -> None:
-        with self.assertRaises(ModelError):
-            FollowUpQuestion("q3", "Why?")
-        with self.assertRaises(ModelError):
-            FollowUpQuestion(1, "Why?")  # type: ignore[arg-type]
+    def test_defaults_keep_legacy_two_argument_calls(self) -> None:
+        question = FollowUpQuestion("q1", "Why?")
+        self.assertEqual(question.target_field, "")
+        self.assertEqual(question.priority, 2)
+
+    def test_accepts_any_positive_integer_id(self) -> None:
+        for question_id in ("q1", "q2", "q3", "q10", "q999"):
+            question = FollowUpQuestion(question_id, "Why?")
+            self.assertEqual(question.id, question_id)
+
+    def test_id_is_stripped(self) -> None:
+        self.assertEqual(FollowUpQuestion("  q4  ", "Why?").id, "q4")
+
+    def test_invalid_ids_rejected(self) -> None:
+        for bad in ("q0", "q01", "q", "1", "q-1", "q1a", "Q1", 1, None, True):
+            with self.assertRaises(ModelError, msg=f"bad id: {bad!r}"):
+                FollowUpQuestion(bad, "Why?")  # type: ignore[arg-type]
 
     def test_question_must_not_be_empty(self) -> None:
         with self.assertRaises(ModelError):
             FollowUpQuestion("q1", "   ")
+        with self.assertRaises(ModelError):
+            FollowUpQuestion("q1", 123)  # type: ignore[arg-type]
+
+    def test_target_field_must_be_string(self) -> None:
+        self.assertEqual(FollowUpQuestion("q1", "Why?", "   ").target_field, "")
+        for bad in (123, None, ["tasks"]):
+            with self.assertRaises(ModelError, msg=f"bad target: {bad!r}"):
+                FollowUpQuestion("q1", "Why?", bad)  # type: ignore[arg-type]
+
+    def test_priority_must_be_integer_in_range(self) -> None:
+        for valid in range(0, 5):
+            self.assertEqual(FollowUpQuestion("q1", "Why?", priority=valid).priority, valid)
+        for bad in (-1, 5, True, "1", 1.5, None):
+            with self.assertRaises(ModelError, msg=f"bad priority: {bad!r}"):
+                FollowUpQuestion("q1", "Why?", priority=bad)  # type: ignore[arg-type]
 
 
 class ActivitySuggestionTests(unittest.TestCase):
@@ -281,24 +389,14 @@ class ActivitySuggestionTests(unittest.TestCase):
 
 
 class ConsultationDraftTests(unittest.TestCase):
-    def test_zero_one_two_questions_allowed(self) -> None:
+    def test_any_number_of_questions_allowed(self) -> None:
         self.assertEqual(ConsultationDraft().follow_up_questions, [])
         one = ConsultationDraft([FollowUpQuestion("q1", "A?")])
         self.assertEqual(len(one.follow_up_questions), 1)
-        two = ConsultationDraft(
-            [FollowUpQuestion("q1", "A?"), FollowUpQuestion("q2", "B?")]
+        five = ConsultationDraft(
+            [FollowUpQuestion(f"q{index}", "A?") for index in range(1, 6)]
         )
-        self.assertEqual(len(two.follow_up_questions), 2)
-
-    def test_three_questions_rejected(self) -> None:
-        with self.assertRaises(ModelError):
-            ConsultationDraft(
-                [
-                    FollowUpQuestion("q1", "A?"),
-                    FollowUpQuestion("q2", "B?"),
-                    FollowUpQuestion("q1", "C?"),
-                ]
-            )
+        self.assertEqual(len(five.follow_up_questions), 5)
 
     def test_duplicate_ids_rejected(self) -> None:
         with self.assertRaises(ModelError):
@@ -323,22 +421,59 @@ class ConsultationDraftTests(unittest.TestCase):
         )
 
     def test_from_dict_does_not_truncate(self) -> None:
-        with self.assertRaises(ModelError):
-            ConsultationDraft.from_dict(
-                {
-                    "follow_up_questions": [
-                        {"question": "A?"},
-                        {"question": "B?"},
-                        {"question": "C?"},
-                    ]
-                }
-            )
+        draft = ConsultationDraft.from_dict(
+            {
+                "follow_up_questions": [
+                    {"question": "A?"},
+                    {"question": "B?"},
+                    {"question": "C?"},
+                    {"question": "D?"},
+                ]
+            }
+        )
+        self.assertEqual(
+            [question.id for question in draft.follow_up_questions],
+            ["q1", "q2", "q3", "q4"],
+        )
+
+    def test_from_dict_parses_target_field_and_priority(self) -> None:
+        draft = ConsultationDraft.from_dict(
+            {
+                "follow_up_questions": [
+                    {
+                        "id": "q7",
+                        "question": "What are your goals?",
+                        "target_field": " goals ",
+                        "priority": 4,
+                    }
+                ]
+            }
+        )
+        question = draft.follow_up_questions[0]
+        self.assertEqual(question.id, "q7")
+        self.assertEqual(question.target_field, "goals")
+        self.assertEqual(question.priority, 4)
+
+    def test_from_dict_defaults_new_question_fields(self) -> None:
+        draft = ConsultationDraft.from_dict(
+            {"follow_up_questions": [{"id": "q2", "question": "A?"}]}
+        )
+        question = draft.follow_up_questions[0]
+        self.assertEqual(question.target_field, "")
+        self.assertEqual(question.priority, 2)
 
     def test_from_dict_invalid_id_rejected(self) -> None:
-        with self.assertRaises(ModelError):
-            ConsultationDraft.from_dict(
-                {"follow_up_questions": [{"id": "q3", "question": "A?"}]}
-            )
+        for bad_id in ("q0", "q01", "q3x"):
+            with self.assertRaises(ModelError, msg=f"bad id: {bad_id!r}"):
+                ConsultationDraft.from_dict(
+                    {"follow_up_questions": [{"id": bad_id, "question": "A?"}]}
+                )
+
+    def test_from_dict_empty_id_is_auto_assigned(self) -> None:
+        draft = ConsultationDraft.from_dict(
+            {"follow_up_questions": [{"id": "", "question": "A?"}]}
+        )
+        self.assertEqual(draft.follow_up_questions[0].id, "q1")
 
     def test_from_dict_invalid_shape(self) -> None:
         with self.assertRaises(ModelError):
@@ -391,6 +526,95 @@ class ConsultationDraftTests(unittest.TestCase):
             ).activity_suggestions,
             [],
         )
+
+    def test_field_states_default_to_empty_and_complete(self) -> None:
+        draft = ConsultationDraft()
+        self.assertEqual(draft.resolved_fields, [])
+        self.assertEqual(draft.unknown_fields, [])
+        self.assertEqual(draft.unresolved_fields, [])
+        self.assertTrue(draft.is_complete)
+
+    def test_is_complete_is_derived_from_unresolved_fields(self) -> None:
+        unresolved = ConsultationDraft(unresolved_fields=["goals"])
+        self.assertFalse(unresolved.is_complete)
+        resolved_only = ConsultationDraft(
+            resolved_fields=["goals"], unknown_fields=["habits"]
+        )
+        self.assertTrue(resolved_only.is_complete)
+        resolved_only.unresolved_fields.append("energy_peak")
+        self.assertFalse(resolved_only.is_complete)
+
+    def test_field_states_are_mutually_exclusive(self) -> None:
+        for first, second in (
+            ("resolved_fields", "unknown_fields"),
+            ("resolved_fields", "unresolved_fields"),
+            ("unknown_fields", "unresolved_fields"),
+        ):
+            with self.assertRaises(ModelError, msg=f"{first} vs {second}"):
+                ConsultationDraft(**{first: ["goals"], second: ["goals"]})
+
+    def test_duplicate_field_names_rejected(self) -> None:
+        with self.assertRaises(ModelError):
+            ConsultationDraft(resolved_fields=["goals", "goals"])
+        with self.assertRaises(ModelError):
+            ConsultationDraft(
+                resolved_fields=[" goals "],
+                unknown_fields=["goals"],
+            )
+
+    def test_field_names_are_normalized(self) -> None:
+        draft = ConsultationDraft(
+            resolved_fields=[" goals ", "habits"],
+            unknown_fields=["energy_peak"],
+        )
+        self.assertEqual(draft.resolved_fields, ["goals", "habits"])
+        self.assertEqual(draft.unknown_fields, ["energy_peak"])
+
+    def test_invalid_field_states_rejected(self) -> None:
+        for field_name in ("resolved_fields", "unknown_fields", "unresolved_fields"):
+            for bad in ("goals", [1], [""], None):
+                with self.assertRaises(ModelError, msg=f"{field_name}={bad!r}"):
+                    ConsultationDraft(**{field_name: bad})
+
+    def test_from_dict_parses_field_states(self) -> None:
+        draft = ConsultationDraft.from_dict(
+            {
+                "resolved_fields": [" goals "],
+                "unknown_fields": ["habits"],
+                "unresolved_fields": ["energy_peak"],
+            }
+        )
+        self.assertEqual(draft.resolved_fields, ["goals"])
+        self.assertEqual(draft.unknown_fields, ["habits"])
+        self.assertEqual(draft.unresolved_fields, ["energy_peak"])
+        self.assertFalse(draft.is_complete)
+
+    def test_from_dict_defaults_field_states(self) -> None:
+        for payload in (
+            {},
+            {
+                "resolved_fields": None,
+                "unknown_fields": None,
+                "unresolved_fields": None,
+            },
+        ):
+            draft = ConsultationDraft.from_dict(payload)
+            self.assertEqual(draft.resolved_fields, [])
+            self.assertEqual(draft.unknown_fields, [])
+            self.assertEqual(draft.unresolved_fields, [])
+            self.assertTrue(draft.is_complete)
+
+    def test_from_dict_rejects_bad_field_states(self) -> None:
+        payloads = [
+            {"resolved_fields": "goals"},
+            {"unknown_fields": [1]},
+            {"unresolved_fields": [""]},
+            {"resolved_fields": ["goals"], "unknown_fields": ["goals"]},
+            {"resolved_fields": ["goals", "goals"]},
+        ]
+        for payload in payloads:
+            with self.assertRaises(ModelError, msg=f"bad payload: {payload!r}"):
+                ConsultationDraft.from_dict(payload)
 
     def test_from_dict_rejects_bad_activity_suggestions(self) -> None:
         payloads = [
@@ -516,6 +740,16 @@ class QuestionnaireDataTests(unittest.TestCase):
         with self.assertRaises(ModelError):
             QuestionnaireData(rest_periods=["sleep"])  # type: ignore[list-item]
 
+    def test_predictable_routines_are_validated(self) -> None:
+        routine = PredictableRoutine("Morning run", [0, 2], 30, preferred_start="07:00")
+        questionnaire = QuestionnaireData(predictable_routines=[routine])
+        self.assertEqual(questionnaire.predictable_routines, [routine])
+        self.assertEqual(QuestionnaireData().predictable_routines, [])
+        tuple_questionnaire = QuestionnaireData(predictable_routines=(routine,))  # type: ignore[arg-type]
+        self.assertEqual(tuple_questionnaire.predictable_routines, [routine])
+        with self.assertRaises(ModelError):
+            QuestionnaireData(predictable_routines=["run"])  # type: ignore[list-item]
+
     def test_normalizes_questionnaire_fields(self) -> None:
         questionnaire = QuestionnaireData(
             name="  Alice ",
@@ -615,7 +849,14 @@ class ScheduledItemTests(unittest.TestCase):
         self.assertEqual(item.task_id, "t1")
         self.assertEqual(item.duration_minutes, 60)
         self.assertFalse(item.completed)
+        self.assertFalse(item.locked)
         self.assertIs(item.task, task)
+
+    def test_locked_must_be_bool(self) -> None:
+        task = TaskInput("A", 60)
+        self.assertTrue(ScheduledItem(task, at(23, 9), at(23, 10), locked=True).locked)
+        with self.assertRaises(ModelError):
+            ScheduledItem(task, at(23, 9), at(23, 10), locked="yes")  # type: ignore[arg-type]
 
     def test_preferred_window_satisfied_is_none_without_preferences(self) -> None:
         item = ScheduledItem(TaskInput("A", 60), at(23, 9), at(23, 10))
